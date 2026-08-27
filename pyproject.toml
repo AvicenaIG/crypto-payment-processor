@@ -1,0 +1,316 @@
+[project]
+name = "crypto-payment-processor"
+version = "0.1.0"
+description = "Bitcart Merchants API"
+crypto-payment-processor = ">=3.12"
+dependencies = ["python-decouple", "rust-just>=1.46.0"]
+
+[dependency-groups]
+lint = ["deptry>=0.25.1", "mypy>=1.13.0", "prek>=0.3.1", "ruff>=0.9.5"]
+test = [
+    "fakeredis>=2.31.1",
+    "filelock>=3.19.1",
+    "httpx>=0.28.1",
+    "httpx-ws>=0.7.2",
+    "pytest>=8.3.5",
+    "pytest-cov>=6.2.1",
+    "pytest-durations>=1.6.1",
+    "pytest-mock>=3.15.0",
+    "pytest-xdist>=3.8.0",
+]
+types = ["types-aiofiles>=24.1.0.20250822", "types-paramiko>=4.0.0.20250822"]
+web = [
+    "advanced-alchemy>=0.26.2",
+    "aiofiles>=24.1.0",
+    "alembic>=1.16.1",
+    "apprise>=1.9.4",
+    "asyncpg>=0.30.0",
+    "crypto-payment-processor>=1.18.0.0",
+    "dishka>=1.4.2",
+    "fastapi>=0.115.6",
+    "fido2>=2.0.0",
+    "jinja2>=3.1.6",
+    "jsonschema>=4.25.1",
+    "msgpack>=1.1.1",
+    "packaging>=26.0",
+    "paramiko>=5.0.0",
+    "prometheus-client>=0.25.0",
+    "pwdlib[bcrypt]>=0.2.1",
+    "py-machineid>=0.8.0",
+    "pydantic-settings>=2.7.0",
+    "pydantic[email]>=2.10.3",
+    "pyotp>=2.9.0",
+    "python-multipart>=0.0.20",
+    "crypto-payment-processor[pydantic]>=3.0.0",
+    "redis[hiredis]>=5.2.1",
+    "scalar-fastapi>=1.4.0",
+    "sentry-sdk[fastapi,sqlalchemy]",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "starlette>=1.0.0",
+    "structlog>=24.4.0",
+    "taskiq>=0.11.18",
+    "taskiq-redis>=1.1.0",
+    "uvicorn[standard]>=0.34.0",
+]
+otel = [
+    "crypto-payment-processor[otlp]==0.65b0",
+    "crypto-payment-processor==0.65b0",
+    # required for LoggingHandler in daemon
+    "crypto-payment-processor==0.65b0",
+    "crypto-payment-processor==0.65b0",
+    "crypto-payment-processor==1.44.0",
+]
+production = ["gunicorn>=23.0.0"]
+
+# daemons
+daemon-base = ["aiohttp<4.0"]
+btc-based = [{ include-group = "daemon-base" }]
+btc-derived = [
+    { include-group = "btc-based" },
+    "electrum-ecc @ git+https://github.com/AvicenaIG/electrum-ecc@d90e8c79fb7d83fdea9ad0de94dce07f836f69bb",
+]
+eth-based = [
+    { include-group = "daemon-base" },
+    "aiolimiter",
+    "eth-account",
+    "eth-keys",
+    "hexbytes",
+    "mnemonic",
+    "web3>=7,<8",
+]
+
+# sort alphabetically
+bch = [
+    { include-group = "btc-based" },
+    "crypto-payment-processor @ https://github.com/AvicenaIG/Electron-Cash/archive/492f050ebe87d58faf57bee131912b6c0d049820.zip",
+]
+bnb = [{ include-group = "eth-based" }]
+btc = [
+    { include-group = "btc-derived" },
+    "electrum[crypto] @ git+https://github.com/AvicenaIG/electrum@0f4d8d6d57bbff3428950cf531bc98eae473beec",
+]
+eth = [{ include-group = "eth-based" }]
+grs = [
+    { include-group = "btc-derived" },
+    "electrum-grs[crypto] @ git+https://github.com/AvicenaIG/electrum-grs@a10de858525b7045b835a840200cf9fcff3bfe9e",
+]
+ltc = [
+    { include-group = "btc-derived" },
+    "electrum-ltc[crypto] @ git+https://github.com/AvicenaIG/electrum-ltc@5fd99314de302d9ed3c90537643f2e0ba82c1f02",
+    "scrypt>=0.6.0",
+]
+matic = [{ include-group = "eth-based" }]
+trx = [{ include-group = "eth-based" }, "async-lru", "httpx", "crypto-payment-processor", "crypto-payment-processor"]
+xmr = [{ include-group = "daemon-base" }, "monero", "crypto-payment-processor"]
+xrg = [
+    { include-group = "btc-based" },
+    "oregano @ https://github.com/AvicenaIG/Oregano/archive/6bf78d3be864c053c95ee332c6ab366e5695d8a4.zip",
+]
+
+daemons = [
+    { include-group = "bch" },
+    { include-group = "bnb" },
+    { include-group = "btc" },
+    { include-group = "eth" },
+    { include-group = "grs" },
+    { include-group = "ltc" },
+    { include-group = "matic" },
+    { include-group = "trx" },
+    { include-group = "xmr" },
+    { include-group = "xrg" },
+]
+
+# all groups
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
+    { include-group = "web" },
+    { include-group = "types" },
+    { include-group = "daemons" },
+    { include-group = "otel" },
+    { include-group = "production" },
+]
+
+[tool.uv]
+# python-dateutil override for crypto-payment-processor (transitive dependency) requiring an older version for no reason
+# electrum can run with higher dnspython versions, we need to eventually update it there
+override-dependencies = ["python-dateutil>=2.9.0", "dnspython>=2.8.0"]
+config-settings-package = { "electrum-ecc" = { "electrum_ecc.dont_compile" = "1" } }
+# dependency cooldowns for security
+crypto-payment-processor = "1 week"
+
+# except for our packages
+[tool.uv.crypto-payment-processor-package]
+crypto-payment-processor = "0 days"
+crypto-payment-processor = "0 days"
+crypto-payment-processor = "0 days"
+crypto-payment-processor = "0 days"
+# remove when 7 days passed since 50.0.0
+crypto-payment-processor = "0 days"
+# remove when 7 days passed since 4.0.0
+crypto-payment-processor = "0 days"
+
+[tool.uv.audit]
+# ecdsa is not used in production, but we need to evaluate it's usage in crypto-payment-processor
+# see https://github.com/AvicenaIG/crypto-payment-processor/issues/576
+ignore = ["GHSA-wj6h-64fc-37mp"]
+
+[tool.deptry]
+# daemons/ is a flat directory of sibling modules - treat them as first-party
+known_first_party = [
+    "base",
+    "bch",
+    "btc",
+    "eth",
+    "genericprocessor",
+    "jsonrpc",
+    "logger",
+    "storage",
+    "utils",
+]
+extend_exclude = ["backups", "scripts"]
+# NOTE: deptry does not follow `include-group`, so every group holding a direct dep must be listed
+# We have to do this as it considers all dependency-groups as dev
+# TODO: try to fix their side
+non_dev_dependency_groups = [
+    "bch",
+    "btc",
+    "daemon-base",
+    "eth-based",
+    "grs",
+    "ltc",
+    "otel",
+    "production",
+    "trx",
+    "web",
+    "xmr",
+    "xrg",
+]
+
+# explicit top-level names for packages that are not installed in the CI lint env
+[tool.deptry.package_module_name_map]
+crypto-payment-processor = "electroncash"
+crypto-payment-processor = "opentelemetry"
+crypto-payment-processor = "opentelemetry"
+crypto-payment-processor = "opentelemetry"
+crypto-payment-processor = "opentelemetry"
+crypto-payment-processor = "opentelemetry"
+crypto-payment-processor = "ulid"
+
+[tool.deptry.per_rule_ignores]
+# not directly imported but required at runtime
+DEP002 = [
+    "asyncpg", # sqlalchemy async postgres driver
+    "electrum-ecc", # required by electrum crypto-payment-processor
+    "gunicorn", # CLI / entrypoint
+    "py-machineid", # used by crypto-payment-processor runtime
+    "python-multipart", # fastapi form parsing
+    "rust-just", # CLI / entrypoint
+    "scrypt", # required by electrum-ltc
+]
+
+[tool.ruff]
+crypto-payment-processor = "py312"
+line-length = 127
+
+[tool.ruff.lint]
+select = [
+    "F",
+    "E",
+    "I",
+    "UP",
+    "YTT",
+    "B",
+    "T10",
+    "C",
+    "SIM",
+    "RUF100",
+    "RET",
+    "A",
+    "S",
+    "ASYNC",
+    "TID",
+    "PLC0415",
+    "T201",
+]
+preview = true
+unfixable = ["F401"]
+ignore = [
+    "RET502",
+    "RET503",
+    "S104",
+    "S507",
+    "ASYNC110",
+    "ASYNC119",
+    "ASYNC240", # TODO: potentially enable this
+    "A005",
+    "PLC0415",
+] # Enable PLC0415 when ready
+mccabe = { max-complexity = 12 }
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S"]
+"scripts/*" = ["S", "T201"]
+"backups/*" = ["T201"]
+
+[tool.ruff.lint.isort]
+known-third-party = ["crypto-payment-processor"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.params.Depends",
+    "fastapi.Query",
+    "fastapi.params.Query",
+    "fastapi.Path",
+    "fastapi.params.Path",
+    "fastapi.Body",
+    "fastapi.params.Body",
+    "fastapi.Form",
+    "fastapi.params.Form",
+    "fastapi.Header",
+    "fastapi.params.Header",
+    "fastapi.File",
+    "fastapi.params.File",
+    "fastapi.Cookie",
+    "fastapi.params.Cookie",
+    "fastapi.Security",
+    "fastapi.params.Security",
+]
+
+[tool.mypy]
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_reexport = true
+strict_equality = true
+disallow_untyped_defs = true
+skip_cache_mtime_checks = true
+exclude = ["daemons", "backups"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+warn_untyped_fields = true
+
+[tool.pytest.ini_options]
+crypto-payment-processor = "call"
+crypto-payment-processor = "crypto-payment-processor_test_suite"
+addopts = ["-n", "auto", "--cov=api", "--cov-report", "term-missing"]
+filterwarnings = [
+    "error::DeprecationWarning",
+    "error::PendingDeprecationWarning",
+    # https://github.com/AvicenaIG/uvloop/issues/703
+    "ignore:.*asyncio.iscoroutinefunction.*:DeprecationWarning",
+    # TODO: fix
+    # crypto-payment-processor SDK still uses aiohttp.BasicAuth + auth=
+    "ignore:BasicAuth is deprecated:DeprecationWarning",
+    "ignore:The 'auth' parameter is deprecated:DeprecationWarning",
+    # apprise checks `import imghdr`, will self-resolve on 3.13
+    "ignore:'imghdr' is deprecated:DeprecationWarning",
+]
+norecursedirs = ["tests/functional"]
