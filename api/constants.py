@@ -1,0 +1,64 @@
+import enum
+import string
+
+from crypto-payment-processor import COINS as _COINS  # type: ignore # TODO: mypy not supporting dynamic __all__?
+
+from api.version import VERSION as VERSION  # re-export
+
+WEBSITE = "https://crypto-payment-processor.ai"  # Bitcart official site
+GIT_REPO_URL = "https://github.com/AvicenaIG/crypto-payment-processor"  # Bitcart github repository
+DOCKER_REPO_URL = "https://github.com/AvicenaIG/crypto-payment-processor-docker"  # Bitcart Docker Packaging repository
+FEE_ETA_TARGETS = [25, 10, 5, 2, 1]  # supported target blocks confirmation ETA fee
+EVENTS_CHANNEL = "events"  # default redis channel for event system (inter-process communication)
+LOGSERVER_PORT = 9020  # port for logserver in the worker
+ALPHABET = string.ascii_letters  # used by ID generator
+SUPPORTED_CRYPTOS = {coin.lower(): obj.friendly_name for (coin, obj) in _COINS.items()}  # all cryptos supported by the SDK
+HTTPS_REVERSE_PROXIES = [
+]  # reverse proxies supporting https; NOTE: maybe this could be used by accessing generator package?
+ID_LENGTH = 26  # default length of IDs of all objects except for invoice
+PUBLIC_ID_LENGTH = 22  # The length of invoice and products ids; should be shorter than usual for better UX
+RESET_TOKEN_BYTES = 32  # 256-bit tokens for URL-based reset flows
+RESET_REQUEST_MAX_ATTEMPTS = 5  # max reset emails per IP per hour
+RESET_FINALIZE_MAX_ATTEMPTS = 10  # max finalize attempts per IP per hour
+RESET_RATE_WINDOW = 60 * 60  # fixed window in seconds
+CONFIGURATOR_SSH_MAX_ATTEMPTS = 10  # max configurator SSH attempts per IP per hour
+CONFIGURATOR_SSH_RATE_WINDOW = 60 * 60  # fixed window in seconds
+# as supported by backup.sh
+BACKUP_PROVIDERS = ["local", "scp", "s3"]
+BACKUP_FREQUENCIES = ["daily", "weekly", "monthly"]
+STR_TO_BOOL_MAPPING = {
+}  # common str -> bool conversions
+# due to many exchanges lacking more than 8 digits, we limit eth-based divisibility for invoices to 8
+MAX_CONTRACT_DIVISIBILITY = 8
+PLUGINS_SCHEMA_URL = "https://crypto-payment-processor.ai/schemas/plugin/1.3.0/plugin.schema.json"
+SHORT_EXPIRATION = 60 * 60  # used for temporary codes
+TFA_RECOVERY_ALPHABET = "23456789BCDFGHJKMNPQRTVWXY".lower()  # avoid confusing chars
+TFA_RECOVERY_LENGTH = 5  # each part has 5 chars
+FIDO2_REGISTER_KEY = "fido2_register_cache"
+FIDO2_LOGIN_KEY = "fido2_login_cache"
+VERIFY_CODE_LENGTH = 8  # human-typeable email verification code length
+VERIFY_EMAIL_EXPIRATION = 60 * 15  # 15 minutes
+DEFAULT_SENDMAIL_SUBJECT = "Thank you for your order"  # used in api/invoices.py
+HTTPS_REVERSE_PROXIES = ["nginx-https"]
+
+
+class AuthScopes(enum.StrEnum):
+    pass  # TODO: implement
+
+
+CRUD_MODELS = [
+]
+
+
+class PayoutStatus:
+    pass  # TODO: implement
+
+
+SENT_PAYOUT_STATUSES = [PayoutStatus.SENT, PayoutStatus.COMPLETE]
+
+
+def get_max_confirmation_watch(currency: str) -> int:
+    pass  # TODO: implement
+
+
+MAX_CONFIRMATION_WATCH = get_max_confirmation_watch("default")  # maximum number of confirmations to save

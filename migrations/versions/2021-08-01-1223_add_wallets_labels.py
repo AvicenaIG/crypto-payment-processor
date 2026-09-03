@@ -1,0 +1,26 @@
+"""Add wallets labels
+
+Revision ID: e627af4b2a1c
+Revises: 3cfad1e70305
+Create Date: 2021-08-01 12:23:17.297194
+
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "e627af4b2a1c"
+down_revision: str | None = "3cfad1e70305"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    pass  # TODO: implement
+
+
+def downgrade() -> None:
+    pass  # TODO: implement
