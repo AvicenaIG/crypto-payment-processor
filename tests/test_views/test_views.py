@@ -26,6 +26,12 @@ from taskiq.exceptions import TaskiqResultTimeoutError
 
 from api import models, utils
 from api.constants import (
+    BACKUP_FREQUENCIES,
+    BACKUP_PROVIDERS,
+    CONFIGURATOR_SSH_MAX_ATTEMPTS,
+    DOCKER_REPO_URL,
+    SUPPORTED_CRYPTOS,
+    PayoutStatus,
 )
 from api.exceptions import ExchangeRatesUnavailableError, RateUnavailableError
 from api.invoices import InvoiceStatus
@@ -48,9 +54,20 @@ from api.templates import TemplateManager
 from api.types import Quotes, TasksBroker
 from tests.fixtures import static_data
 from tests.helper import (
+    create_discount,
+    create_invoice,
+    create_payout,
+    create_product,
+    create_store,
+    create_token,
+    create_user,
+    create_wallet,
+    enabled_logs,
+    make_client,
 )
 
 if TYPE_CHECKING:
+    from httpx import AsyncClient as TestClient
 
 pytestmark = pytest.mark.anyio
 
@@ -61,342 +78,1803 @@ del settings
 
 
 class DummyInstance:
-    pass  # TODO: implement
+    coin_name = "BTC"
 
 
 async def test_docs_root(client: TestClient) -> None:
+    response = await client.get("/")
+    assert response.status_code == 200
 
 
 async def test_rate(client: TestClient) -> None:
+    resp = await client.get("/cryptos/rate")
+    assert resp.status_code == 200
+    assert resp.json() == "50000"
+    assert (await client.get("/cryptos/rate?fiat_currency=eur")).status_code == 200
+    assert (await client.get("/cryptos/rate?fiat_currency=EUR")).status_code == 200
+    assert (await client.get("/cryptos/rate?fiat_currency=test")).status_code == 422
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "Infinity"])
 async def test_rate_invalid(client: TestClient, mocker: pytest_mock.MockerFixture, value: str) -> None:
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", return_value=Decimal(value))
+    assert (await client.get("/cryptos/rate")).status_code == 422
 
 
 async def test_wallet_rate(client: TestClient, token: str, wallet: dict[str, Any]) -> None:
+    resp = await client.get(f"/wallets/{wallet['id']}/rate")
+    assert resp.status_code == 200
+    assert resp.json() == "50000"
+    assert (await client.get(f"/wallets/{wallet['id']}/rate?currency=eur")).status_code == 200
+    assert (await client.get(f"/wallets/{wallet['id']}/rate?currency=EUR")).status_code == 200
+    assert (await client.get(f"/wallets/{wallet['id']}/rate?currency=test")).status_code == 422
 
 
 @pytest.mark.parametrize(
+    ("user_exists", "correct_pwd"),
+    [
+        pytest.param(True, True, id="exist-user-correct-pwd"),
+        pytest.param(True, False, id="exist-user-wrong-pwd"),
+        pytest.param(False, False, id="non-exist-user"),
+    ],
 )
 async def test_create_token(client: TestClient, user: dict[str, Any], user_exists: bool, correct_pwd: bool) -> None:
+    email = user["email"] if user_exists else "non-exist@example.com"
+    password = static_data.USER_PWD if (user_exists and correct_pwd) else "wrong-password"
+    resp = await client.post("/token", json={"email": email, "password": password})
+    if user_exists and correct_pwd:
+        assert resp.status_code == 200
+        j = resp.json()
+        assert j.get("access_token")
+        assert j["token_type"] == "bearer"
+    else:
+        assert resp.status_code == 401
 
 
 async def test_noauth(client: TestClient) -> None:
+    assert (await client.get("/users")).status_code == 401
+    assert (await client.get("/wallets")).status_code == 401
+    assert (await client.get("/stores")).status_code == 401
+    assert (await client.get("/products")).status_code == 401
+    assert (await client.get("/invoices")).status_code == 401
+    assert (
+        await client.post("/discounts", json={"name": "test_no_auth", "percent": 20, "end_date": "2020-01-01 21:19:34.503627"})
+    ).status_code == 401
+    assert (await client.get("/products?&store=2")).status_code == 200
 
 
 async def test_superuseronly(client: TestClient, token: str, limited_token: str) -> None:
+    assert (await client.get("/users", headers={"Authorization": f"Bearer {limited_token}"})).status_code == 403
+    assert (await client.get("/users", headers={"Authorization": f"Bearer {token}"})).status_code == 200
 
 
 async def test_users_me(client: TestClient, user: dict[str, Any], token: str) -> None:
+    assert (await client.get("/users/me")).status_code == 401
+    resp = await client.get("/users/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j.items() > {"is_superuser": True, "email": user["email"]}.items()
+    assert "created" in j
 
 
 def mock_missing_rate(exchange: str, pair: str | None = None) -> Decimal | Quotes:
-    pass  # TODO: implement
+    return {} if pair is None else Decimal("NaN")
 
 
 async def test_wallets_balance(client: TestClient, token: str, wallet: dict[str, Any], mock_btc_balance: Any) -> None:
+    assert (await client.get("/wallets/balance")).status_code == 401
+    resp = await client.get("/wallets/balance", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {"balance": "75000.00", "currency": "USD", "missing_rates": []}
 
 
 async def test_wallets_balance_missing_rates(
+    client: TestClient, token: str, wallet: dict[str, Any], mock_btc_balance: Any, mocker: pytest_mock.MockerFixture
 ) -> None:
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=mock_missing_rate)
+    resp = await client.get("/wallets/balance", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {"balance": "0.00", "currency": "USD", "missing_rates": ["BTC"]}
 
 
 async def test_wallets_balance_skips_empty_wallets(
+    client: TestClient, token: str, wallet: dict[str, Any], mocker: pytest_mock.MockerFixture
 ) -> None:
+    mocker.patch(
+        "crypto-payment-processor.BTC.balance",
+        new=mocker.AsyncMock(return_value={"confirmed": Decimal(0), "unconfirmed": Decimal(0), "unmatured": Decimal(0)}),
+    )
+    get_rate = mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=mock_missing_rate)
+    resp = await client.get("/wallets/balance", headers={"Authorization": f"Bearer {token}"})
+    assert resp.json() == {"balance": "0.00", "currency": "USD", "missing_rates": []}
+    get_rate.assert_not_called()
 
 
 async def test_ratesinfo(client: TestClient, token: str, limited_token: str) -> None:
+    assert (await client.get("/manage/ratesinfo")).status_code == 401
+    assert (await client.get("/manage/ratesinfo", headers={"Authorization": f"Bearer {limited_token}"})).status_code == 403
+    resp = await client.get("/manage/ratesinfo", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+    assert (await client.get("/cryptos/rate")).status_code == 200
+    resp = await client.get("/manage/ratesinfo", headers={"Authorization": f"Bearer {token}"})
+    sources = resp.json()
+    assert len(sources) == 1
+    info = sources[0]
+    assert {"name": "coingecko", "last_error": None, "last_error_at": None}.items() <= info.items()
+    assert utils.time.now() - datetime.fromisoformat(info["fetched_at"]) < timedelta(minutes=1)
+    assert info["age"] >= 0
 
 
 async def test_rates_worker_unavailable(
+    client: TestClient,
+    token: str,
+    store: dict[str, Any],
+    wallet: dict[str, Any],
+    mock_btc_balance: Any,
+    mocker: pytest_mock.MockerFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    mocker.patch(
+        "api.services.exchange_rate.ExchangeRateService.get_rate",
+        side_effect=ExchangeRatesUnavailableError("The worker did not answer the exchange rates request"),
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    for method, url, body in [
+        ("GET", "/cryptos/rate", None),
+        ("GET", f"/wallets/{wallet['id']}/rate", None),
+        ("GET", "/wallets/balance", None),
+        ("GET", f"/stores/{store['id']}/rates?currencies=BTC_USD,LTC_USD", None),
+        ("PATCH", f"/stores/{store['id']}/rate_rules", "X_X = coingecko(X_X)"),
+    ]:
+        resp = await client.request(method, url, json=body, headers=headers)
+        assert resp.status_code == 503, url
+        assert resp.json() == {"error": "Exchange rates unavailable", "detail": "Exchange rates are temporarily unavailable"}
+    assert "GET /cryptos/rate: The worker did not answer the exchange rates request" in caplog.text
+    resp = await client.post("/invoices", json={"store_id": store["id"], "price": 5}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["payments"] == []
 
 
 async def test_invoice_logs_rates_unavailable_cause(
+    client: TestClient,
+    token: str,
+    store: dict[str, Any],
+    mocker: pytest_mock.MockerFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     def unavailable(*args: Any, **kwargs: Any) -> None:
-        pass  # TODO: implement
+        raise ExchangeRatesUnavailableError("The worker did not answer") from TaskiqResultTimeoutError(timeout=20)
 
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=unavailable)
+    resp = await client.post(
+        "/invoices", json={"store_id": store["id"], "price": 5}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.json()["payments"] == []
+    assert "skipped payment method BTC: The worker did not answer (TaskiqResultTimeoutError" in caplog.text
 
 
 async def test_failed_rate_rules_not_saved(
+    client: TestClient, token: str, store: dict[str, Any], mocker: pytest_mock.MockerFixture
 ) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.patch(f"/stores/{store['id']}/rate_rules", json="X_X = coingecko(X_X", headers=headers)
+    assert resp.status_code == 422
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=ExchangeRatesUnavailableError())
+    resp = await client.patch(f"/stores/{store['id']}/rate_rules", json="X_X = kraken(X_X)", headers=headers)
+    assert resp.status_code == 503
+    resp = await client.get(f"/stores/{store['id']}", headers=headers)
+    assert resp.json()["checkout_settings"]["rate_rules"] == ""
 
 
 async def test_store_rates(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.get(f"/stores/{store['id']}/rates?currencies=BTC_USD,BTCUSD")
+    assert resp.json() == {
+        "rates": [
+            {"rate": "50000", "message": "BTC_USD: 50000 (resolved by X_X)"},
+            {"rate": None, "message": "BTCUSD: invalid currency pair"},
+        ]
+    }
+    resp = await client.patch(f"/stores/{store['id']}/rate_rules", json="BTC_USD = 0", headers=headers)
+    assert resp.status_code == 200
+    resp = await client.get(f"/stores/{store['id']}/rates?currencies=BTC_USD")
+    assert resp.json() == {"rates": [{"rate": None, "message": "BTC_USD: no valid rate, rules gave 0 (resolved by BTC_USD)"}]}
+    resp = await client.patch(f"/stores/{store['id']}/rate_rules", json="BTC_USD = 0.00000001", headers=headers)
+    assert resp.status_code == 200
+    resp = await client.get(f"/stores/{store['id']}/rates?currencies=BTC_USD")
+    assert resp.json() == {"rates": [{"rate": "0.00000001", "message": "BTC_USD: 0.00000001 (resolved by BTC_USD)"}]}
 
 
 async def test_fiatlist(client: TestClient) -> None:
+    resp = await client.get("/cryptos/fiatlist")
+    assert resp.status_code == 200
+    j1 = resp.json()
+    assert isinstance(j1, list)
+    assert "BTC" in j1
+    assert "USD" in j1
+    resp2 = await client.get("/cryptos/fiatlist?query=b")
+    assert resp2.status_code == 200
+    j2 = resp2.json()
+    assert isinstance(j2, list)
+    assert "BTC" in j2
+    resp3 = await client.get("/cryptos/fiatlist?query=U")
+    assert resp3.status_code == 200
+    j3 = resp3.json()
+    assert isinstance(j3, list)
+    assert "USD" in j3
+    resp4 = await client.get("/cryptos/fiatlist?query=BTC|USD")
+    assert resp4.status_code == 200
+    j4 = resp4.json()
+    assert "BTC" in j4
+    assert "USD" in j4
+    resp5 = await client.get(r"/cryptos/fiatlist?query=btc\\")
+    assert resp5.status_code == 200
+    assert resp5.json() == []
 
 
 @pytest.mark.exchange_rates(cryptos={"btc": BTC(), "ltc": LTC()})
 async def test_fiatlist_multi_coins(client: TestClient) -> None:
+    resp = await client.get("/cryptos/fiatlist")
+    assert len(resp.json()) == 4
 
 
 async def check_ws_response(ws: AsyncWebSocketSession, sent_amount: Decimal | int) -> None:
+    data = await ws.receive_json()
+    assert (
+        data.items()
+        >= {"status": "paid", "exception_status": "none", "sent_amount": sent_amount, "paid_currency": "BTC"}.items()
+    )
+    assert data["payment_id"] is not None
+    data = await ws.receive_json()
+    assert (
+        data.items()
+        >= {"status": "complete", "exception_status": "none", "sent_amount": sent_amount, "paid_currency": "BTC"}.items()
+    )
+    assert data["payment_id"] is not None
 
 
 async def check_ws_response_complete(ws: AsyncWebSocketSession, sent_amount: Decimal | int) -> None:
+    data = await ws.receive_json()
+    assert (
+        data.items()
+        >= {"status": "complete", "exception_status": "none", "sent_amount": sent_amount, "paid_currency": "BTC"}.items()
+    )
+    assert data["payment_id"] is not None
 
 
 async def check_ws_response2(ws: AsyncWebSocketSession) -> None:
+    data = await ws.receive_json()
+    assert data == {"status": "success", "balance": "1.5"}
 
 
 @pytest.mark.parametrize(
+    ("store_exists", "authorized"),
+    [
+        pytest.param(True, False, id="non-exist-store-unauthorized"),
+        pytest.param(False, True, id="non-exist-store-authorized"),
+        pytest.param(True, False, id="store-unauthorized"),
+        pytest.param(True, True, id="store-authorized"),
+    ],
 )
 async def test_ping_email(client: TestClient, token: str, store: dict[str, Any], store_exists: bool, authorized: bool) -> None:
+    store_id = store["id"] if store_exists else 999
+    resp = await client.get(f"/stores/{store_id}/ping", headers={"Authorization": f"Bearer {token}"} if authorized else {})
+    if authorized:
+        if store_exists:
+            assert resp.status_code == 200
+            assert not resp.json()
+        else:
+            assert resp.status_code == 404
+    else:
+        assert resp.status_code == 401
 
 
 async def test_user_stats(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    store_id = store["id"]
+    await create_product(client, token, store_id=store_id)
+    await create_invoice(client, token, store_id=store_id)
+    await create_invoice(client, token, store_id=store_id)
+    resp = await client.get("/users/stats", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert (
+        data.items()
+        > {
+            "discounts": 0,
+            "invoices": 2,
+            "notifications": 0,
+            "products": 1,
+            "stores": 1,
+            "templates": 0,
+            "wallets": 1,
+        }.items()
+    )
 
 
 @pytest.mark.parametrize(
+    "categories",
+    [
+        pytest.param(["all"], id="single"),
+        pytest.param(["all", "test"], id="multiple"),
+    ],
 )
 async def test_categories(client: TestClient, token: str, categories: list[str], store: dict[str, Any]) -> None:
+    assert (await client.get("/products/categories")).status_code == 422
+    store_id = store["id"]
+    # all category is there always
+    assert (await client.get(f"/products/categories?store={store_id}")).json() == ["all"]
+    for category in categories:
+        await create_product(client, token, store_id=store_id, category=category)
+    resp = await client.get(f"/products/categories?store={store_id}")
+    assert resp.status_code == 200
+    assert resp.json() == categories
 
 
 async def test_token(client: TestClient, token_data: dict[str, Any]) -> None:
+    assert (await client.get("/token")).status_code == 401
+    resp = await client.get("/token", headers={"Authorization": f"Bearer {token_data['id']}"})
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j["count"] == 1
+    assert not j["previous"]
+    assert not j["next"]
+    result = j["result"]
+    assert isinstance(result, list)
+    assert len(result) == 1
+    result = result[0]
+    assert {
+        "app_id": token_data["app_id"],
+        "permissions": token_data["permissions"],
+        "user_id": token_data["user_id"],
+        "redirect_url": token_data["redirect_url"],
+    }.items() <= result.items()
 
 
 async def test_token_current(client: TestClient, token: str, user: dict[str, Any]) -> None:
+    assert (await client.get("/token/current")).status_code == 401
+    resp = await client.get("/token/current", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    j = resp.json()
+    assert isinstance(j, dict)
+    assert j["user_id"] == user["id"]
+    assert j["app_id"] == ""
+    assert j["redirect_url"] == ""
+    assert j["permissions"] == ["full_control"]
+    assert j["id"] == token
 
 
 async def test_token_count(client: TestClient, token: str) -> None:
+    assert (await client.get("/token/count")).status_code == 401
+    resp = await client.get("/token/count", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == 1
 
 
 async def test_patch_token(client: TestClient, token: str) -> None:
+    assert (await client.patch(f"/token/{token}", json={"redirect_url": "google.com:443"})).status_code == 401
+    resp = await client.patch(
+        f"/token/{token}",
+        json={"redirect_url": "google.com:443"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j["redirect_url"] == "google.com:443"
+    assert j["id"] == token
 
 
 @pytest.mark.parametrize(
+    ("user_exists", "authorized"),
+    [
+        pytest.param(False, False, id="non-user-unauthorized"),
+        pytest.param(False, True, id="non-user-authorized"),
+        pytest.param(True, False, id="user-unauthorized"),
+        pytest.param(True, True, id="user-authorized"),
+    ],
 )
 async def test_create_tokens(
+    client: TestClient, user: dict[str, Any], token: str, user_exists: bool, authorized: bool
 ) -> None:
+    password = static_data.USER_PWD
+    email = user["email"] if user_exists else f"NULL{user['email']}"
+    resp = await client.post(
+        "/token",
+        json={"email": email, "password": password},
+        headers={"Authorization": f"Bearer {token}"} if authorized else {},
+    )
+    if authorized:
+        assert resp.status_code == 200
+    else:
+        if user_exists:
+            assert resp.status_code == 200
+        else:
+            assert resp.status_code == 401
 
 
 async def test_token_permissions_control(
+    client: TestClient, token: str, limited_user: dict[str, Any], limited_token: str
 ) -> None:
+    # Selective permissions control is done by client, not by server
+    resp = await client.post(
+        "/token",
+        json={"permissions": ["store_management:2"]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j["permissions"] == ["store_management:2"]
+    # Limited token can't access higher scopes
+    resp = await client.post(
+        "/token",
+        json={"permissions": ["store_management"]},
+        headers={"Authorization": f"Bearer {limited_token}"},
+    )
+    assert resp.status_code == 403
+    token_management_only_token = (
+        await client.post("/token", json={"permissions": ["token_management"]}, headers={"Authorization": f"Bearer {token}"})
+    ).json()["id"]
+    assert (
+        await client.post(
+            "/token",
+            json={"permissions": ["store_management"]},
+            headers={"Authorization": f"Bearer {token_management_only_token}"},
+        )
+    ).status_code == 403
+    # Strict mode: non-superuser user can't create superuser token
+    resp = await client.post(
+        "/token",
+        json={"email": limited_user["email"], "password": static_data.USER_PWD, "permissions": ["server_management"]},
+    )
+    assert resp.status_code == 422
+    # Non-strict mode: silently removes server_management permission
+    resp = await client.post(
+        "/token",
+        json={
+            "email": limited_user["email"],
+            "password": static_data.USER_PWD,
+            "permissions": ["server_management"],
+            "strict": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["permissions"] == []
 
 
 @pytest.mark.parametrize(
+    ("token_exists", "authorized"),
+    [
+        pytest.param(False, False, id="non-token-unauthorized"),
+        pytest.param(False, True, id="non-token-authorized"),
+        pytest.param(True, False, id="token-unauthorized"),
+        pytest.param(True, True, id="token-authorized"),
+    ],
 )
 async def test_delete_token(client: TestClient, token: str, token_exists: bool, authorized: bool) -> None:
+    fetch_token = token if token_exists else 1
+    resp = await client.delete(
+        f"/token/{fetch_token}",
+        headers={"Authorization": f"Bearer {token}"} if authorized else {},
+    )
+    if authorized:
+        if token_exists:
+            assert resp.status_code == 200
+        else:
+            assert resp.status_code == 404
+    else:
+        assert resp.status_code == 401
 
 
 async def test_management_commands(
+    client: TestClient, log_file: str, token: str, limited_token: str, settings: Settings
 ) -> None:
+    assert (await client.post("/manage/update")).status_code == 401
+    assert (await client.post("/manage/update", headers={"Authorization": f"Bearer {limited_token}"})).status_code == 403
+    assert (await client.post("/manage/update", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.post("/manage/restart", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.post("/manage/plugin-reload", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.post("/manage/cleanup/images", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.post("/manage/cleanup/logs", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.post("/manage/cleanup", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.post("/manage/backups/backup", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.get("/manage/backups/download/1", headers={"Authorization": f"Bearer {token}"})).status_code == 503
+    assert (
+        await client.post(
+            "/manage/backups/restore",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"backup": ("backup.tar.gz", b"test")},
+        )
+    ).status_code == 200  # requires uploading file
+    assert (await client.get("/manage/daemons", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    with enabled_logs(settings):
+        assert (await client.post("/manage/cleanup", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+        assert not os.path.exists(log_file)
 
 
 async def test_first_user_registration_bypasses_disable_registration(client: TestClient) -> None:
+    resp = await client.post("/users", json=static_data.POLICY_USER)
+    assert resp.status_code == 200
+    resp = await client.post("/users", json={**static_data.POLICY_USER, "email": "other@test.com"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Registration disabled"
 
 
 async def test_policies(client: TestClient, token: str) -> None:
+    resp = await client.get("/manage/policies")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "allow_powered_by_crypto-payment-processor": False,
+        "allow_anonymous_configurator": True,
+        "disable_registration": True,  # set to True automatically after first user signed up
+        "require_verified_email": False,
+        "allow_file_uploads": True,
+        "discourage_index": False,
+        "check_updates": True,
+        "staging_updates": False,
+        "captcha_sitekey": "",
+        "admin_theme_url": "",
+        "captcha_type": CaptchaType.NONE,
+        "use_html_templates": False,
+        "global_templates": {
+            "forgotpassword": "",
+            "syncinfo": "",
+            "verifyemail": "",
+        },
+        "explorer_urls": {
+            "btc": static_data.DEFAULT_EXPLORER,
+        },
+        "rpc_urls": {},
+        "health_check_store_id": "",
+        "allow_eth_plugin_info": True,
+        "log_retention_days": 90,
+    }
+    assert (await client.post("/manage/policies")).status_code == 401
+    resp = await client.post(
+        "/manage/policies",
+        json={"disable_registration": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "allow_powered_by_crypto-payment-processor": False,
+        "allow_anonymous_configurator": True,
+        "disable_registration": True,
+        "require_verified_email": False,
+        "allow_file_uploads": True,
+        "discourage_index": False,
+        "check_updates": True,
+        "staging_updates": False,
+        "captcha_sitekey": "",
+        "captcha_secretkey": "",
+        "admin_theme_url": "",
+        "captcha_type": CaptchaType.NONE,
+        "use_html_templates": False,
+        "global_templates": {
+            "forgotpassword": "",
+            "syncinfo": "",
+            "verifyemail": "",
+        },
+        "explorer_urls": {
+            "btc": static_data.DEFAULT_EXPLORER,
+        },
+        "rpc_urls": {},
+        "email_settings": EmailSettings().model_dump(),
+        "health_check_store_id": "",
+        "allow_eth_plugin_info": True,
+        "log_retention_days": 90,
+    }
+    assert (await client.post("/users", json=static_data.POLICY_USER)).status_code == 422  # registration is off
+    # Test for loading data from db instead of loading scheme's defaults
+    assert (await client.get("/manage/policies")).json() == {
+        "allow_powered_by_crypto-payment-processor": False,
+        "allow_anonymous_configurator": True,
+        "disable_registration": True,
+        "require_verified_email": False,
+        "allow_file_uploads": True,
+        "discourage_index": False,
+        "check_updates": True,
+        "staging_updates": False,
+        "captcha_sitekey": "",
+        "admin_theme_url": "",
+        "captcha_type": CaptchaType.NONE,
+        "use_html_templates": False,
+        "global_templates": {
+            "forgotpassword": "",
+            "syncinfo": "",
+            "verifyemail": "",
+        },
+        "explorer_urls": {
+            "btc": static_data.DEFAULT_EXPLORER,
+        },
+        "rpc_urls": {},
+        "health_check_store_id": "",
+        "allow_eth_plugin_info": True,
+        "log_retention_days": 90,
+    }
+    resp = await client.post(
+        "/manage/policies",
+        json={"disable_registration": False},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "allow_powered_by_crypto-payment-processor": False,
+        "allow_anonymous_configurator": True,
+        "disable_registration": False,
+        "require_verified_email": False,
+        "allow_file_uploads": True,
+        "discourage_index": False,
+        "check_updates": True,
+        "staging_updates": False,
+        "captcha_sitekey": "",
+        "captcha_secretkey": "",
+        "admin_theme_url": "",
+        "captcha_type": CaptchaType.NONE,
+        "use_html_templates": False,
+        "global_templates": {
+            "forgotpassword": "",
+            "syncinfo": "",
+            "verifyemail": "",
+        },
+        "explorer_urls": {
+            "btc": static_data.DEFAULT_EXPLORER,
+        },
+        "rpc_urls": {},
+        "email_settings": EmailSettings().model_dump(),
+        "health_check_store_id": "",
+        "allow_eth_plugin_info": True,
+        "log_retention_days": 90,
+    }
+    assert (await client.post("/users", json=static_data.POLICY_USER)).status_code == 200  # registration is on again
+    resp = await client.get("/manage/stores")
+    assert resp.status_code == 200
+    assert resp.json() == {"pos_id": ""}
+    assert (await client.post("/manage/stores")).status_code == 401
+    resp = await client.post(
+        "/manage/stores",
+        json={"pos_id": "2"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"pos_id": "2"}
+    assert (await client.get("/manage/stores")).json() == {"pos_id": "2"}
+    resp = await client.post(
+        "/manage/stores",
+        json={"pos_id": "1"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"pos_id": "1"}
 
 
 async def test_policies_store_created(client: TestClient, store: dict[str, Any]) -> None:
+    resp = await client.get("/manage/stores")
+    assert resp.status_code == 200
+    assert resp.json()["pos_id"] == store["id"]
 
 
 async def test_no_token_management(client: TestClient, limited_token: str) -> None:
+    assert (await client.get("/token/current", headers={"Authorization": f"Bearer {limited_token}"})).status_code == 200
+    assert (await client.get("/token", headers={"Authorization": f"Bearer {limited_token}"})).status_code == 403
+    assert (await client.get("/token/count", headers={"Authorization": f"Bearer {limited_token}"})).status_code == 403
+    assert (
+        await client.patch(
+            f"/token/{limited_token}",
+            headers={"Authorization": f"Bearer {limited_token}"},
+        )
+    ).status_code == 403
+    assert (
+        await client.delete(
+            f"/token/{limited_token}",
+            headers={"Authorization": f"Bearer {limited_token}"},
+        )
+    ).status_code == 403
 
 
 async def test_non_superuser_permissions(client: TestClient, user: dict[str, Any], limited_user: dict[str, Any]) -> None:
+    resp = await client.post(
+        "/token",
+        json={
+            "email": limited_user["email"],
+            "password": static_data.USER_PWD,
+            "permissions": ["full_control"],
+            "strict": False,
+        },
+    )
+    token = resp.json()["access_token"]
+    assert (await client.get("/token", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (await client.get(f"/users/{user['id']}", headers={"Authorization": f"Bearer {token}"})).status_code == 403
 
 
 async def test_notification_list(client: TestClient, app: FastAPI) -> None:
+    notification_manager = await app.state.dishka_container.get(NotificationManager)
+    resp = await client.get("/notifications/list")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "count": len(notification_manager.notifiers),
+        "next": None,
+        "previous": None,
+        "result": list(notification_manager.notifiers.keys()),
+    }
 
 
 async def test_notification_schema(client: TestClient, app: FastAPI) -> None:
+    notification_manager = await app.state.dishka_container.get(NotificationManager)
+    resp = await client.get("/notifications/schema")
+    assert resp.status_code == 200
+    assert resp.json() == notification_manager.notifiers
 
 
 async def test_template_list(client: TestClient, app: FastAPI) -> None:
+    template_manager = await app.state.dishka_container.get(TemplateManager)
+    resp = await client.get("/templates/list")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "count": len(template_manager.templates_strings),
+        "next": None,
+        "previous": None,
+        "result": template_manager.templates_strings,
+    }
+    resp1 = await client.get("/templates/list?show_all=true")
+    result = [v for template_set in template_manager.templates_strings.values() for v in template_set]
+    assert resp1.status_code == 200
+    assert resp1.json() == {
+        "count": len(result),
+        "next": None,
+        "previous": None,
+        "result": result,
+    }
+    resp2 = await client.get("/templates/list?applicable_to=product")
+    assert resp2.status_code == 200
+    assert resp2.json() == {
+        "count": len(template_manager.templates_strings["product"]),
+        "next": None,
+        "previous": None,
+        "result": template_manager.templates_strings["product"],
+    }
+    resp3 = await client.get("/templates/list?applicable_to=notfound")
+    assert resp3.status_code == 200
+    assert resp3.json() == {
+        "count": 0,
+        "next": None,
+        "previous": None,
+        "result": [],
+    }
 
 
 async def test_services(client: TestClient, token: str, app: FastAPI) -> None:
+    tor_service = await app.state.dishka_container.get(TorService)
+    resp = await client.get("/tor/services")
+    assert resp.status_code == 200
+    assert resp.json() == await tor_service.get_data("anonymous_services_dict", {}, json_decode=True)
+    resp2 = await client.get("/tor/services", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.status_code == 200
+    assert resp2.json() == await tor_service.get_data("services_dict", {}, json_decode=True)
 
 
 async def test_export_invoices(client: TestClient, token: str, limited_user: dict[str, Any]) -> None:
+    limited_token = (await create_token(client, limited_user))["access_token"]
+    invoice = await create_invoice(client, limited_token)
+    await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice["id"]], "command": "mark_complete"},
+        headers={"Authorization": f"Bearer {limited_token}"},
+    )
+    assert (await client.get("/invoices/export")).status_code == 401
+    assert (
+        await client.get("/invoices/export?all_users=true", headers={"Authorization": f"Bearer {limited_token}"})
+    ).status_code == 403
+    assert len((await client.get("/invoices/export", headers={"Authorization": f"Bearer {limited_token}"})).json()) > 0
+    json_resp = await client.get("/invoices/export", headers={"Authorization": f"Bearer {token}"})
+    assert json_resp.status_code == 200
+    assert isinstance(json_resp.json(), list)
+    assert len(json_resp.json()) == 0
+    assert "crypto-payment-processor-export" in json_resp.headers["content-disposition"]
+    resp2 = await client.get("/invoices/export?export_format=json", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.json() == json_resp.json()
+    csv_resp = await client.get("/invoices/export?export_format=csv", headers={"Authorization": f"Bearer {token}"})
+    assert csv_resp.status_code == 200
+    assert "crypto-payment-processor-export" in csv_resp.headers["content-disposition"]
+    assert csv_resp.text.endswith("\r\n")
+    json_resp = await client.get("/invoices/export?all_users=true", headers={"Authorization": f"Bearer {token}"})
+    data = json_resp.json()
+    assert len(data) == 1
+    assert data[0]["id"] == invoice["id"]
+    assert "payments" not in data[0]
+    assert (
+        "payments"
+        in (
+            await client.get("/invoices/export?all_users=true&add_payments=true", headers={"Authorization": f"Bearer {token}"})
+        ).json()[0]
+    )
 
 
 async def test_batch_commands(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    store_id = store["id"]
+    assert (await client.post("/invoices/batch")).status_code == 401
+    assert (await client.post("/invoices/batch", headers={"Authorization": f"Bearer {token}"})).status_code == 422
+    assert (
+        await client.post("/invoices/batch", json={"ids": [], "command": "test"}, headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 404
+    assert (
+        await client.post("/invoices", json={"store_id": "-1", "price": 0.5}, headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 404
+    resp1 = await client.post(
+        "/invoices", json={"store_id": store_id, "price": 0.5}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp1.status_code == 200
+    invoice_id_1 = resp1.json()["id"]
+    resp2 = await client.post(
+        "/invoices", json={"store_id": store_id, "price": 0.5}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp2.status_code == 200
+    invoice_id_2 = resp2.json()["id"]
+    assert (
+        await client.post(
+            "/invoices/batch",
+            json={"ids": [invoice_id_1, invoice_id_2], "command": "delete"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await client.get("/invoices", headers={"Authorization": f"Bearer {token}"})).json()["result"] == []
+    resp3 = await client.post(
+        "/invoices", json={"store_id": store_id, "price": 0.5}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp3.status_code == 200
+    invoice_id_3 = resp3.json()["id"]
+    assert (
+        await client.post(
+            "/invoices/batch",
+            json={"ids": [invoice_id_3], "command": "mark_invalid"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await client.get(f"/invoices/{invoice_id_3}", headers={"Authorization": f"Bearer {token}"})).json()[
+        "status"
+    ] == "invalid"
+    assert (
+        await client.post(
+            "/invoices/batch",
+            json={"ids": [invoice_id_3], "command": "mark_complete"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await client.get(f"/invoices/{invoice_id_3}", headers={"Authorization": f"Bearer {token}"})).json()[
+        "status"
+    ] == "complete"
 
 
 async def test_wallet_ws(client: TestClient, token: str, app: FastAPI, mock_btc_balance: Any) -> None:
+    redis_pool = await app.state.dishka_container.get(Redis)
+    r = await client.post(
+        "/wallets",
+        json={"name": "testws1", "xpub": static_data.TEST_XPUB},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    wallet_id = r.json()["id"]
+    websocket: AsyncWebSocketSession
+    async with aconnect_ws(f"/ws/wallets/{wallet_id}?token={token}", client) as websocket:
+        await asyncio.sleep(1)
+        balance = str((await BTC(xpub=static_data.TEST_XPUB, rpc_url=MAIN_URL).balance())["confirmed"])
+        await utils.redis.publish_message(redis_pool, f"wallet:{wallet_id}", {"status": "success", "balance": balance})
+        await check_ws_response2(websocket)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        async with aconnect_ws(f"/ws/wallets/{wallet_id}", client) as websocket:
+            await check_ws_response2(websocket)
+    assert exc.value.code == WS_1008_POLICY_VIOLATION
+    with pytest.raises(WebSocketDisconnect) as exc:
+        async with aconnect_ws(f"/ws/wallets/{wallet_id}?token=x", client) as websocket:
+            await check_ws_response2(websocket)
+    assert exc.value.code == WS_1008_POLICY_VIOLATION
+    with pytest.raises(WebSocketDisconnect) as exc:
+        async with aconnect_ws(f"/ws/wallets/555?token={token}", client) as websocket:
+            await check_ws_response2(websocket)
+    assert exc.value.code == WS_1008_POLICY_VIOLATION
 
 
 async def test_invoice_ws(client: TestClient, token: str, store: dict[str, Any], app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    store_id = store["id"]
+    r = await client.post("/invoices", json={"store_id": store_id, "price": 5}, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+    data = r.json()
+    invoice_id = data["id"]
+    websocket: AsyncWebSocketSession
+    websocket2: AsyncWebSocketSession
+    async with aconnect_ws(f"/ws/invoices/{invoice_id}", client) as websocket:
+        await asyncio.sleep(1)
+        await payment_processor.new_payment_handler(
+            DummyInstance(),
+            None,
+            data["payments"][0]["lookup_field"],
+            InvoiceStatus.UNCONFIRMED,
+            None,
+            [],
+            data["payments"][0]["amount"],
+        )  # emulate paid invoice
+        await check_ws_response(websocket, data["payments"][0]["amount"])
+    async with aconnect_ws(
+        f"/ws/invoices/{invoice_id}", client
+    ) as websocket2:  # test if after invoice was completed websocket returns immediately
+        await check_ws_response_complete(websocket2, data["payments"][0]["amount"])
+    with pytest.raises(WebSocketDisconnect) as exc:
+        async with aconnect_ws("/ws/invoices/555", client) as websocket:
+            await check_ws_response(websocket, 0)
+    assert exc.value.code == WS_1008_POLICY_VIOLATION
+    with pytest.raises(WebSocketDisconnect) as exc:
+        async with aconnect_ws("/ws/invoices/invalid_id", client) as websocket:
+            await check_ws_response(websocket, 0)
+    assert exc.value.code == WS_1008_POLICY_VIOLATION
 
 
 def get_in_use_connections(redis_pool: Redis) -> int:
-    pass  # TODO: implement
+    return next(
+        count
+        for count, attributes in redis_pool.connection_pool.get_connection_count()
+        if attributes[DB_CLIENT_CONNECTION_STATE] == ConnectionState.USED.value
+    )
 
 
 async def test_ws_releases_redis_connections(client: TestClient, token: str, store: dict[str, Any], app: FastAPI) -> None:
+    redis_pool = await app.state.dishka_container.get(Redis)
+    invoice_id = (await create_invoice(client, token, store_id=store["id"]))["id"]
+    baseline = get_in_use_connections(redis_pool)
+    async with make_client(app) as ws_client:
+        for _ in range(5):
+            async with aconnect_ws(f"/ws/invoices/{invoice_id}", ws_client):
+                pass
+    assert get_in_use_connections(redis_pool) == baseline
 
 
 @pytest.mark.parametrize("currencies", ["", "DUMMY", "btc"])
 async def test_create_invoice_discount(client: TestClient, token: str, store: dict[str, Any], currencies: str) -> None:
+    store_id = store["id"]
+    # create discount
+    new_discount = {
+        "name": "apple",
+        "percent": 50,
+        "currencies": currencies,
+        "promocode": "testpromo",
+        "end_date": "2099-12-31 00:00:00.000000",
+    }
+    create_discount_resp = await client.post("/discounts", json=new_discount, headers={"Authorization": f"Bearer {token}"})
+    assert create_discount_resp.status_code == 200
+    discount_id = create_discount_resp.json()["id"]
+    # create product
+    new_product = {"name": "apple", "price": 0.80, "quantity": 1.0, "store_id": store_id, "discounts": [discount_id]}
+    create_product_resp = await client.post(
+        "/products", data={"data": json_module.dumps(new_product)}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert create_product_resp.status_code == 200
+    product_id = create_product_resp.json()["id"]
+    invoice_resp = await client.post(
+        "/invoices",
+        json={"store_id": store_id, "price": 0.5, "products": [product_id], "promocode": "testpromo"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert invoice_resp.status_code == 200
+    assert {
+        "price": "0.50",
+        "store_id": store_id,
+        "promocode": "testpromo",
+        "products": [product_id],
+    }.items() < invoice_resp.json().items()
+    assert (
+        await client.delete(f"/invoices/{invoice_resp.json()['id']}", headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 200
 
 
 async def test_get_or_create_invoice_by_order_id(client: TestClient, token: str, store: dict[str, Any], app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    store_id = store["id"]
+    resp = await client.post("/invoices/order_id/1", json={"price": 5, "store_id": store_id})
+    assert resp.status_code == 200
+    assert resp.json()["order_id"] == "1"
+    assert (await client.post("/invoices/order_id/1", json={"price": 5, "store_id": store_id})).json()["id"] == resp.json()[
+        "id"
+    ]
+    await payment_processor.new_payment_handler(
+        DummyInstance(), None, resp.json()["payments"][0]["lookup_field"], "complete", None
+    )
+    assert (await client.post("/invoices/order_id/1", json={"price": 5, "store_id": store_id})).json()["id"] == resp.json()[
+        "id"
+    ]
 
 
 async def test_get_max_product_price(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    empty_resp = await client.get(f"/products/maxprice?store={store['id']}", headers={"Authorization": f"Bearer {token}"})
+    assert empty_resp.json() == "0.00"
+    # create product
+    price = 999999.0
+    new_product = {"name": "apple", "price": price, "quantity": 1.0, "store_id": store["id"]}
+    create_product_resp = await client.post(
+        "/products", data={"data": json_module.dumps(new_product)}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert create_product_resp.status_code == 200
+    maxprice_resp = await client.get(
+        f"/products/maxprice?store={new_product['store_id']}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert maxprice_resp.status_code == 200
+    assert maxprice_resp.json() == "999999.00"
 
 
 async def test_create_product_with_image(
+    client: TestClient, token: str, image: bytes, store: dict[str, Any], settings: Settings
 ) -> None:
+    store_id = store["id"]
+    new_product = {"name": "sunflower", "price": 0.1, "quantity": 1.0, "store_id": store_id}
+    # post
+    create_product_resp = await client.post(
+        "/products",
+        data={"data": json_module.dumps(new_product)},
+        files={"image": image},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert create_product_resp.status_code == 200
+    product_dict = create_product_resp.json()
+    assert isinstance(product_dict["image"], str)
+    assert product_dict["image"] == f"images/products/{product_dict['id']}.png"
+    # patch
+    patch_product_resp = await client.patch(
+        f"/products/{product_dict['id']}",
+        data={
+            "data": json_module.dumps(
+                {"price": 0.15, "quantity": 2.0, "user_id": product_dict["user_id"], "name": "sunflower"}
+            )
+        },
+        files={"image": image},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert patch_product_resp.status_code == 200
+    assert os.path.exists(os.path.join(settings.products_image_dir, f"{product_dict['id']}.png"))
+    assert (
+        await client.post(
+            "/products/batch",
+            json={"ids": [product_dict["id"]], "command": "delete"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert not os.path.exists(os.path.join(settings.products_image_dir, f"{product_dict['id']}.png"))
 
 
 async def test_create_invoice_without_coin_rate(
+    client: TestClient, token: str, mocker: pytest_mock.MockerFixture, store: dict[str, Any]
 ) -> None:
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=mock_missing_rate)
+    r = await client.post(
+        "/invoices",
+        json={"store_id": store["id"], "price": 9.9, "currency": "DUMMY"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    result = r.json()
+    assert result["price"] == "9.90"
+    assert result["payments"] == []
 
 
 @pytest.mark.parametrize(
+    ("rate", "price", "amount", "raw_rate"),
+    [("0.004", 1, "250.00000000", "0.004"), ("3", 10, "3.33333334", "3")],
 )
 async def test_create_invoice_rate(
+    client: TestClient,
+    token: str,
+    mocker: pytest_mock.MockerFixture,
+    store: dict[str, Any],
+    rate: str,
+    price: int,
+    amount: str,
+    raw_rate: str,
 ) -> None:
+    mocker.patch(
+        "api.services.exchange_rate.ExchangeRateService.get_rate",
+        side_effect=lambda exchange, pair=None: {"BTC_USD": Decimal(rate)} if pair is None else Decimal(rate),
+    )
+    resp = await client.post(
+        "/invoices", json={"store_id": store["id"], "price": price}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    payments = resp.json()["payments"]
+    assert len(payments) == 1
+    payment = payments[0]
+    assert payment["amount"] == amount
+    assert payment["rate"] == raw_rate
 
 
 @pytest.mark.parametrize(
+    ("underpaid_percentage", "request_amount"),
+    [(0, Decimal("0.00001667")), (50, Decimal("0.00000834")), (99, Decimal("0.00000017"))],
 )
 async def test_create_invoice_underpaid_amount(
+    client: TestClient,
+    token: str,
+    mocker: pytest_mock.MockerFixture,
+    store: dict[str, Any],
+    underpaid_percentage: int,
+    request_amount: Decimal,
 ) -> None:
+    mocker.patch(
+        "api.services.exchange_rate.ExchangeRateService.get_rate",
+        side_effect=lambda exchange, pair=None: {"BTC_USD": Decimal(60000)} if pair is None else Decimal(60000),
+    )
+    resp = await client.patch(
+        f"/stores/{store['id']}/checkout_settings",
+        json={"underpaid_percentage": underpaid_percentage},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    add_request = mocker.spy(BTC, "add_request")
+    payment = (await create_invoice(client, token, store_id=store["id"], price=1))["payments"][0]
+    assert payment["amount"] == "0.00001667"
+    assert payment["rate"] == "60000"
+    assert add_request.call_args.args[1] == request_amount
 
 
 async def enable_network_fee(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    resp = await client.patch(
+        f"/stores/{store['id']}/checkout_settings",
+        json={"include_network_fee": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
 
 
 async def create_discounted_invoice(
+    client: TestClient, token: str, store: dict[str, Any], discount: dict[str, Any]
 ) -> dict[str, Any]:
+    product = await create_product(client, token, store_id=store["id"], discounts=[discount["id"]])
+    return await create_invoice(
+        client, token, store_id=store["id"], price=5000, products=[product["id"]], promocode=discount["promocode"]
+    )
 
 
 async def test_create_invoice_network_fee(
+    client: TestClient, token: str, mocker: pytest_mock.MockerFixture, store: dict[str, Any]
 ) -> None:
+    await enable_network_fee(client, token, store)
+    mocker.patch.object(InvoiceService, "determine_network_fee", return_value=Decimal("0.000012345678"))
+    invoice = await create_discounted_invoice(client, token, store, await create_discount(client, token, percent=50))
+    payment = invoice["payments"][0]
+    assert payment["amount"] == "0.05001235"
+    assert payment["subtotal"] == "0.05000000"
+    assert payment["network_fee"] == "0.00001235"
+    assert payment["effective_price"] == "2500.00"
 
 
 async def test_payment_discount_snapshot(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    discount = await create_discount(client, token, percent=10)
+    invoice = await create_discounted_invoice(client, token, store, discount)
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.patch(f"/discounts/{discount['id']}", json={"name": "renamed", "percent": 20}, headers=headers)
+    assert resp.status_code == 200
+    assert (await client.delete(f"/discounts/{discount['id']}", headers=headers)).status_code == 200
+    payment = (await client.get(f"/invoices/{invoice['id']}", headers=headers)).json()["payments"][0]
+    assert payment["discount"] == discount["id"]
+    assert payment["applied_discount"] == {"name": discount["name"], "percent": 10}
+    assert payment["effective_price"] == "4500.00"
 
 
 @pytest.mark.parametrize(("percent", "effective_price"), [(None, "5000.00"), (10, "4500.00")])
 async def test_invoice_effective_price(
+    client: TestClient, token: str, store: dict[str, Any], percent: int | None, effective_price: str
 ) -> None:
+    second_wallet = (await create_wallet(client, token))["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.patch(f"/stores/{store['id']}", json={"wallets": [*store["wallets"], second_wallet]}, headers=headers)
+    assert resp.status_code == 200
+    if percent is None:
+        invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    else:
+        invoice = await create_discounted_invoice(client, token, store, await create_discount(client, token, percent=percent))
+    assert len(invoice["payments"]) == 2
+    assert invoice["price"] == "5000.00"
+    assert invoice["effective_price"] == effective_price
+    resp = await client.post("/invoices/batch", json={"ids": [invoice["id"]], "command": "mark_complete"}, headers=headers)
+    assert resp.status_code == 200
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers=headers)).json()
+    assert invoice["payment_id"] is not None
+    assert invoice["price"] == "5000.00"
+    assert invoice["effective_price"] == effective_price
 
 
 @pytest.mark.parametrize(
+    ("tx_hashes", "tx_amounts", "expected"),
+    [
+        (
+            ["tx2", "tx1"],
+            {"tx1": "0.06", "tx2": "0.04"},
+            [{"tx_hash": "tx2", "amount": "0.04000000"}, {"tx_hash": "tx1", "amount": "0.06000000"}],
+        ),
+        (
+            ["tx1", "tx2"],
+            {"tx2": "0.04"},
+            [{"tx_hash": "tx1", "amount": None}, {"tx_hash": "tx2", "amount": "0.04000000"}],
+        ),
+        (["tx1"], None, [{"tx_hash": "tx1", "amount": None}]),
+    ],
 )
 async def test_invoice_transactions(
+    client: TestClient,
+    token: str,
+    store: dict[str, Any],
+    app: FastAPI,
+    tx_hashes: list[str],
+    tx_amounts: dict[str, str] | None,
+    expected: list[dict[str, str | None]],
 ) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    await payment_processor.new_payment_handler(
+        DummyInstance(),
+        None,
+        invoice["payments"][0]["lookup_field"],
+        InvoiceStatus.UNCONFIRMED,
+        None,
+        tx_hashes,
+        invoice["payments"][0]["amount"],
+        tx_amounts=tx_amounts,
+    )
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers={"Authorization": f"Bearer {token}"})).json()
+    assert invoice["tx_hashes"] == tx_hashes
+    assert invoice["transactions"] == expected
 
 
 async def test_new_block_keeps_transactions(
+    client: TestClient, token: str, store: dict[str, Any], app: FastAPI, mocker: pytest_mock.MockerFixture
 ) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    resp = await client.patch(f"/stores/{store['id']}/checkout_settings", json={"transaction_speed": 2}, headers=headers)
+    assert resp.status_code == 200
+    invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    payment = invoice["payments"][0]
+    mocker.patch.object(PaymentProcessor, "get_confirmations", side_effect=[1, 2])
+    await payment_processor.new_payment_handler(
+        DummyInstance(),
+        None,
+        payment["lookup_field"],
+        InvoiceStatus.COMPLETE,
+        None,
+        ["tx1", "tx2"],
+        payment["amount"],
+        tx_amounts={"tx1": "0.06", "tx2": "0.04"},
+    )
+    assert (await client.get(f"/invoices/{invoice['id']}", headers=headers)).json()["status"] == "confirmed"
+    await payment_processor.new_block_handler(DummyInstance(), "new_block", 1)
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers=headers)).json()
+    assert invoice["status"] == "complete"
+    assert invoice["transactions"] == [
+        {"tx_hash": "tx1", "amount": "0.06000000"},
+        {"tx_hash": "tx2", "amount": "0.04000000"},
+    ]
 
 
 @pytest.mark.parametrize(("sent_amount", "exception_status"), [(0.09, "none"), (0.1, "none"), (0.11, "paid_over")])
 async def test_mark_complete_exception_status(
+    client: TestClient, token: str, store: dict[str, Any], sent_amount: float, exception_status: str
 ) -> None:
+    invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    resp = await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice["id"]], "command": "mark_complete", "options": {"sent_amount": sent_amount}},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers={"Authorization": f"Bearer {token}"})).json()
+    assert invoice["exception_status"] == exception_status
 
 
 @pytest.mark.parametrize(("options", "sent_price"), [({}, "5000.00"), ({"sent_amount": 0.05}, "2500.00")])
 async def test_invoice_sent_price(
+    client: TestClient, token: str, store: dict[str, Any], options: dict[str, Any], sent_price: str
 ) -> None:
+    invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    assert invoice["sent_price"] == "0.00"
+    resp = await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice["id"]], "command": "mark_complete", "options": options},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers={"Authorization": f"Bearer {token}"})).json()
+    assert invoice["sent_price"] == sent_price
+    assert invoice["payments"][0]["due"] == "0.00000000"
 
 
 async def test_invoice_payment_due(client: TestClient, token: str, store: dict[str, Any], app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    payment = invoice["payments"][0]
+    assert (payment["due"], payment["due_price"]) == ("0.10000000", "5000.00")
+    await payment_processor.new_payment_handler(
+        DummyInstance(), None, payment["lookup_field"], InvoiceStatus.PENDING, None, ["tx1"], Decimal("0.06")
+    )
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers={"Authorization": f"Bearer {token}"})).json()
+    assert invoice["exception_status"] == "paid_partial"
+    payment = invoice["payments"][0]
+    assert (payment["due"], payment["due_price"]) == ("0.04000000", "2000.00")
 
 
 async def test_lightning_payment_method_amount(
+    client: TestClient, token: str, mocker: pytest_mock.MockerFixture, app: FastAPI
 ) -> None:
+    coin_service = await app.state.dishka_container.get(CoinService)
+    mocker.patch.dict(coin_service.crypto_settings["btc"], {"lightning": True})
+    wallet = await create_wallet(client, token, lightning_enabled=True)
+    store = await create_store(client, token, custom_store_attrs={"wallets": [wallet["id"]]})
+    resp = await client.patch(
+        f"/stores/{store['id']}/checkout_settings",
+        json={"underpaid_percentage": 10, "include_network_fee": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    mocker.patch.object(InvoiceService, "determine_network_fee", return_value=Decimal("0.00001"))
+    mocker.patch.object(BTC, "node_id", new_callable=mocker.PropertyMock, side_effect=lambda: asyncio.sleep(0, "node"))
+    add_invoice = mocker.patch.object(
+        BTC, "add_invoice", new=mocker.AsyncMock(return_value={"lightning_invoice": "lnbc1test", "rhash": "rhash1"})
+    )
+    add_request = mocker.spy(BTC, "add_request")
+    payments = (await create_invoice(client, token, store_id=store["id"], price=5000))["payments"]
+    onchain, lightning = sorted(payments, key=lambda payment: payment["lightning"])
+    assert lightning["lightning"]
+    assert add_invoice.call_args.args[0] == Decimal("0.1")
+    assert lightning["amount"] == "0.10000000"
+    assert lightning["network_fee"] == "0.00000000"
+    assert lightning["payment_url"] == "lnbc1test"
+    assert add_request.call_args.args[1] == Decimal("0.09001")
+    assert onchain["amount"] == "0.10001000"
+    assert onchain["network_fee"] == "0.00001000"
 
 
 @pytest.mark.parametrize(
+    "error",
+    [RateUnavailableError("ETH", "USD"), ExchangeRatesUnavailableError(), Exception("Currently not supported")],
 )
 async def test_create_invoice_network_fee_failure(
+    client: TestClient, token: str, mocker: pytest_mock.MockerFixture, store: dict[str, Any], error: Exception
 ) -> None:
+    await enable_network_fee(client, token, store)
+    determine_network_fee = mocker.patch.object(InvoiceService, "determine_network_fee", side_effect=error)
+    resp = await client.post(
+        "/invoices", json={"store_id": store["id"], "price": 5000}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    payments = resp.json()["payments"]
+    assert len(payments) == 1
+    payment = payments[0]
+    assert payment["amount"] == "0.10000000"
+    assert payment["network_fee"] == "0.00000000"
+    determine_network_fee.assert_awaited_once()
 
 
 async def send_payouts(client: TestClient, token: str, ids: list[str], options: dict[str, Any] | None = None) -> None:
+    resp = await client.post(
+        "/payouts/batch",
+        json={"command": "send", "ids": ids, "options": options or {}},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
 
 
 async def create_store_payout(client: TestClient, token: str, store: dict[str, Any], **attrs: Any) -> str:
+    payout = await create_payout(client, token, {"store_id": store["id"], "wallet_id": store["wallets"][0], **attrs})
+    return payout["id"]
 
 
 async def mark_payout_sent(app: FastAPI, payout_id: str, tx_hash: str) -> None:
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        payout_service = await container.get(PayoutService)
+        payout_manager = await container.get(PayoutManager)
+        payout = await payout_service.get(payout_id)
+        payout.update(tx_hash=tx_hash)
+        await payout_manager.update_status(payout, PayoutStatus.SENT)
 
 
 async def get_payout_state(client: TestClient, token: str, payout_id: str) -> tuple[str, str | None]:
+    payout = (await client.get(f"/payouts/{payout_id}", headers={"Authorization": f"Bearer {token}"})).json()
+    return payout["status"], payout["tx_hash"]
 
 
 async def test_payout_used_fee_in_wallet_currency(client: TestClient, token: str, app: FastAPI) -> None:
+    payout = await create_payout(client, token)
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        payout_service = await container.get(PayoutService)
+        (await payout_service.get(payout["id"])).update(used_fee=Decimal("0.0000123456789"))
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (await client.get(f"/payouts/{payout['id']}", headers=headers)).json()["used_fee"] == "0.00001235"
+    assert (await client.delete(f"/wallets/{payout['wallet_id']}", headers=headers)).status_code == 200
+    assert (await client.get(f"/payouts/{payout['id']}", headers=headers)).json()["used_fee"] == "0.00001235"
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        payout_service = await container.get(PayoutService)
+        (await payout_service.get(payout["id"])).update(wallet_currency=None)
+    assert (await client.get(f"/payouts/{payout['id']}", headers=headers)).json()["used_fee"] == "0.0000123456789"
 
 
 async def test_payout_fails_without_rate(client: TestClient, token: str, mocker: pytest_mock.MockerFixture) -> None:
+    payout = await create_payout(client, token)
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=mock_missing_rate)
+    prepare_tx = mocker.patch.object(PayoutManager, "prepare_tx")
+    await send_payouts(client, token, [payout["id"]])
+    assert await get_payout_state(client, token, payout["id"]) == (PayoutStatus.FAILED, None)
+    prepare_tx.assert_not_called()
 
 
 async def test_batch_payout_max_fee_per_payout_rate(
+    client: TestClient, token: str, store: dict[str, Any], mocker: pytest_mock.MockerFixture
 ) -> None:
+    mocker.patch("crypto-payment-processor.BTC.pay_to_many", new=mocker.AsyncMock(return_value="raw_tx"))
+    broadcast = mocker.patch.object(PayoutManager, "broadcast_tx_flow", return_value=None)
+    payout_ids = [
+        await create_store_payout(client, token, store, currency=currency, max_fee=max_fee)
+        for currency, max_fee in [("USD", "10"), ("EUR", "9.5"), ("USD", None)]
+    ]
+    await send_payouts(client, token, payout_ids, {"batch": True})
+    broadcast.assert_awaited_once()
+    assert broadcast.call_args.args[-1] == Decimal("0.0002")
 
 
 async def test_batch_payout_skips_sent_payouts(
+    client: TestClient, token: str, store: dict[str, Any], app: FastAPI, mocker: pytest_mock.MockerFixture
 ) -> None:
+    pay_to_many = mocker.patch("crypto-payment-processor.BTC.pay_to_many", new=mocker.AsyncMock(return_value="raw_tx"))
+    mocker.patch.object(PayoutManager, "broadcast_tx_flow", return_value="new_tx")
+    sent_id = await create_store_payout(client, token, store)
+    pending_id = await create_store_payout(client, token, store)
+    await mark_payout_sent(app, sent_id, "old_tx")
+    await send_payouts(client, token, [sent_id, pending_id], {"batch": True})
+    assert len(pay_to_many.call_args.args[0]) == 1
+    assert await get_payout_state(client, token, sent_id) == (PayoutStatus.SENT, "old_tx")
+    assert await get_payout_state(client, token, pending_id) == (PayoutStatus.SENT, "new_tx")
 
 
 async def test_failed_batch_payout_keeps_sent_payouts(
+    client: TestClient, token: str, store: dict[str, Any], app: FastAPI, mocker: pytest_mock.MockerFixture
 ) -> None:
+    sent_id = await create_store_payout(client, token, store)
+    pending_id = await create_store_payout(client, token, store)
+    await mark_payout_sent(app, sent_id, "old_tx")
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=mock_missing_rate)
+    await send_payouts(client, token, [sent_id, pending_id], {"batch": True})
+    assert await get_payout_state(client, token, sent_id) == (PayoutStatus.SENT, "old_tx")
+    assert await get_payout_state(client, token, pending_id) == (PayoutStatus.FAILED, None)
 
 
 async def test_create_invoice_and_pay(client: TestClient, token: str, store: dict[str, Any], app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    store_id = store["id"]
+    # create invoice
+    r = await client.post("/invoices", json={"store_id": store_id, "price": 9.9}, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+    data = r.json()
+    invoice_id = data["id"]
+    # get payment
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        payment_method_repository = await container.get(PaymentMethodRepository)
+        payment_method = await payment_method_repository.get_one(
+            statement=select(models.PaymentMethod).where(models.PaymentMethod.invoice_id == invoice_id),
+        )
+    await payment_processor.new_payment_handler(
+        DummyInstance(), None, data["payments"][0]["lookup_field"], "complete", None
+    )  # pay the invoice
+    # validate invoice paid_currency
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        invoice_service = await container.get(InvoiceService)
+        final_invoice = await invoice_service.get(invoice_id)
+    assert final_invoice.paid_currency == payment_method.currency.upper()
+    assert final_invoice.payment_id == payment_method.id
+    await client.delete(f"/invoices/{invoice_id}", headers={"Authorization": f"Bearer {token}"})
 
 
 async def test_get_public_store(client: TestClient, store: dict[str, Any], token: str) -> None:
+    store_id = store["id"]
+    user_id = (
+        await client.post(
+            "/users",
+            json={"email": "test2auth@example.com", "password": "test12345"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).json()["id"]
+    new_token = (
+        await client.post(
+            "/token",
+            json={"email": "test2auth@example.com", "password": "test12345", "permissions": ["full_control"]},
+        )
+    ).json()["access_token"]
+    # When logged in, allow limited access to public objects
+    PUBLIC_KEYS = {
+        "created",
+        "updated",
+        "name",
+        "default_currency",
+        "id",
+        "user_id",
+        "checkout_settings",
+        "theme_settings",
+        "currency_data",
+        "metadata",
+    }
+    assert (
+        set((await client.get(f"/stores/{store_id}", headers={"Authorization": f"Bearer {new_token}"})).json().keys())
+        == PUBLIC_KEYS
+    )
+    await client.delete(f"/users/{user_id}")
+    # get store without user
+    store_resp = await client.get(f"/stores/{store_id}")
+    assert set(store_resp.json().keys()) == PUBLIC_KEYS
 
 
 async def test_public_store_support_contact(client: TestClient, store: dict[str, Any], token: str) -> None:
+    store_id = store["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (await client.get(f"/stores/{store_id}")).json()["checkout_settings"]["support_email"] == ""
+    resp = await client.patch(
+        f"/stores/{store_id}/email_settings",
+        json={"address": "noreply@sender.example", "user": "smtp-user", "password": "smtp-password"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    resp = await client.patch(
+        f"/stores/{store_id}/checkout_settings",
+        json={"support_email": "support@example.com", "support_url": "https://example.com/help"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    public_resp = await client.get(f"/stores/{store_id}")
+    assert public_resp.status_code == 200
+    data = public_resp.json()
+    assert "email_settings" not in data
+    assert data["checkout_settings"]["support_email"] == "support@example.com"
+    assert data["checkout_settings"]["support_url"] == "https://example.com/help"
+    for secret in ("noreply@sender.example", "smtp-user", "smtp-password"):
+        assert secret not in public_resp.text
+    resp = await client.patch(
+        f"/stores/{store_id}/checkout_settings",
+        json={"support_email": "", "support_url": "https:example.com"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["checkout_settings"]["support_email"] == ""
+    assert resp.json()["checkout_settings"]["support_url"] == "https://example.com/"
 
 
 # TODO: why do we need ?store=X in this case?
 async def test_get_product_params(client: TestClient, token: str, product: dict[str, Any]) -> None:
+    product_id = product["id"]
+    store_id = product["store_id"]
+    assert (await client.get(f"/products/{product_id}", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert (
+        await client.get(f"/products/{product_id}?store={store_id}", headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 200
+    assert (
+        await client.get(f"/products/{product_id}?store=555", headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 404
 
 
 async def test_product_count_params(client: TestClient, token: str) -> None:
+    resp = await client.get(
+        "/products/count?sale=true&store=2&category=Test&min_price=0.0001&max_price=100.0",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.json() == 0
 
 
 async def test_updatecheck(client: TestClient) -> None:
+    resp = await client.get("/update/check")
+    assert resp.status_code == 200
+    assert resp.json() == {"update_available": False, "tag": None}
 
 
 async def test_logs_list(client: TestClient, token: str, settings: Settings) -> None:
+    assert (await client.get("/manage/logs")).status_code == 401
+    resp = await client.get("/manage/logs", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+    with enabled_logs(settings):
+        assert (await client.get("/manage/logs", headers={"Authorization": f"Bearer {token}"})).json() == [
+            "crypto-payment-processor.log",
+            "crypto-payment-processor20210821.log",
+        ]
 
 
 async def test_logs_get(client: TestClient, token: str, settings: Settings) -> None:
+    assert (await client.get("/manage/logs/1")).status_code == 401
+    assert (await client.get("/manage/logs/1", headers={"Authorization": f"Bearer {token}"})).status_code == 400
+    with enabled_logs(settings):
+        assert (await client.get("/manage/logs/1", headers={"Authorization": f"Bearer {token}"})).status_code == 404
+        resp = await client.get("/manage/logs/crypto-payment-processor.log", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json() == "Test"
 
 
 async def test_logs_delete(client: TestClient, log_file: str, token: str, settings: Settings) -> None:
+    log_name = os.path.basename(log_file)
+    assert (await client.delete("/manage/logs/1")).status_code == 401
+    assert (await client.delete("/manage/logs/1", headers={"Authorization": f"Bearer {token}"})).status_code == 400
+    # Tests that it is impossible to delete files outside logs directory:
+    assert (await client.delete("/manage/logs//root/path", headers={"Authorization": f"Bearer {token}"})).status_code == 404
+    assert (
+        await client.delete("/manage/logs/..%2F.gitignore", headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 404
+    with enabled_logs(settings):
+        assert (await client.delete("/manage/logs/1", headers={"Authorization": f"Bearer {token}"})).status_code == 404
+        assert (
+            await client.delete("/manage/logs/crypto-payment-processor.log", headers={"Authorization": f"Bearer {token}"})
+        ).status_code == 403
+        resp = await client.delete(f"/manage/logs/{log_name}", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json() is True
+    assert not os.path.exists(log_file)
 
 
 async def test_cryptos(client: TestClient, app: FastAPI) -> None:
+    coin_service = await app.state.dishka_container.get(CoinService)
+    resp = await client.get("/cryptos")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "count": len(coin_service.cryptos),
+        "next": None,
+        "previous": None,
+        "result": list(coin_service.cryptos.keys()),
+    }
 
 
 async def test_wallet_balance(client: TestClient, token: str, wallet: dict[str, Any], mock_btc_balance: Any) -> None:
+    assert (await client.get(f"/wallets/{wallet['id']}/balance")).status_code == 401
+    resp = await client.get(f"/wallets/{wallet['id']}/balance", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "confirmed": "1.50000000",
+        "lightning": "0.00000000",
+        "unconfirmed": "0.00000000",
+        "unmatured": "0.00000000",
+    }
 
 
 async def test_lightning_endpoints(client: TestClient, token: str, wallet: dict[str, Any]) -> None:
+    wallet_id = wallet["id"]
+    assert (await client.get(f"/wallets/{wallet_id}/checkln")).status_code == 401
+    assert (await client.get("/wallets/555/checkln", headers={"Authorization": f"Bearer {token}"})).status_code == 404
+    assert (await client.get("/wallets/555/channels", headers={"Authorization": f"Bearer {token}"})).status_code == 404
+    assert (
+        await client.post(
+            "/wallets/555/channels/open", json={"node_id": "test", "amount": 0.1}, headers={"Authorization": f"Bearer {token}"}
+        )
+    ).status_code == 404
+    assert (
+        await client.post(
+            "/wallets/555/channels/close", json={"channel_point": "test"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    ).status_code == 404
+    assert (
+        await client.post("/wallets/555/lnpay", json={"invoice": "test"}, headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 404
+    resp = await client.get(f"/wallets/{wallet_id}/checkln", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() is False
+    resp2 = await client.get(f"/wallets/{wallet_id}/channels", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.status_code == 200
+    assert resp2.json() == []
+    assert (
+        await client.post(
+            f"/wallets/{wallet_id}/channels/open",
+            json={"node_id": "test", "amount": 0.1},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 400
+    assert (
+        await client.post(
+            f"/wallets/{wallet_id}/channels/close",
+            json={"channel_point": "test"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 400
+    assert (
+        await client.post(
+            f"/wallets/{wallet_id}/lnpay", json={"invoice": "test"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    ).status_code == 400
 
 
 async def test_multiple_wallets_same_currency(client: TestClient, token: str) -> None:
+    wallet1_id = (await create_wallet(client, token))["id"]
+    wallet2_id = (await create_wallet(client, token))["id"]
+    resp = await client.post(
+        "/stores",
+        json={"name": "Multiple Currency", "wallets": [wallet1_id, wallet2_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    store_id = resp.json()["id"]
+    resp = await client.post("/invoices", json={"price": 5, "store_id": store_id})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["payments"]) == 2
+    assert data["payments"][0]["name"] == "BTC (1)"
+    assert data["payments"][1]["name"] == "BTC (2)"
 
 
 async def test_change_store_checkout_settings(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    store_id = store["id"]
+    assert (await client.patch(f"/stores/{store_id}/checkout_settings")).status_code == 401
+    assert (
+        await client.patch(
+            "/stores/555/checkout_settings", json={"expiration": 60}, headers={"Authorization": f"Bearer {token}"}
+        )
+    ).status_code == 404
+    resp = await client.patch(
+        f"/stores/{store_id}/checkout_settings", json={"expiration": 60}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    # Changes only the settings provided
+    default_values = StoreCheckoutSettings().model_dump()
+    assert resp.json()["checkout_settings"] == {**default_values, "expiration": 60}
+    assert len(resp.json()["wallets"]) > 0
+    resp2 = await client.get(f"/stores/{store_id}", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.status_code == 200
+    data1 = resp.json()
+    data2 = resp2.json()
+    data1.pop("updated")
+    data2.pop("updated")
+    assert data1 == data2
+    resp = await client.patch(
+        f"/stores/{store_id}/checkout_settings",
+        json={"use_html_templates": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["checkout_settings"] == {**default_values, "expiration": 60, "use_html_templates": True}
 
 
 async def test_change_store_theme_settings(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    store_id = store["id"]
+    assert (await client.patch(f"/stores/{store_id}/theme_settings")).status_code == 401
+    assert (
+        await client.patch(
+            "/stores/555/theme_settings", json={"store_theme_url": "url"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    ).status_code == 404
+    resp = await client.patch(
+        f"/stores/{store_id}/theme_settings", json={"store_theme_url": "url"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    # Changes only the settings provided
+    default_values = StoreThemeSettings().model_dump()
+    assert resp.json()["theme_settings"] == {**default_values, "store_theme_url": "url"}
+    assert len(resp.json()["wallets"]) > 0
+    resp2 = await client.get(f"/stores/{store_id}", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.status_code == 200
+    data1 = resp.json()
+    data2 = resp2.json()
+    data1.pop("updated")
+    data2.pop("updated")
+    assert data1 == data2
+    resp = await client.patch(
+        f"/stores/{store_id}/theme_settings",
+        json={"checkout_theme_url": "url2"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["theme_settings"] == {**default_values, "store_theme_url": "url", "checkout_theme_url": "url2"}
 
 
 async def test_products_list(client: TestClient) -> None:
+    assert (await client.get("/products")).status_code == 401
+    assert (await client.get("/products?store=1")).status_code == 200
+    resp = await client.get("/products?store=0")
+    assert resp.status_code == 200
+    assert resp.json()["result"] == []
 
 
 PUBLIC_IP = "93.184.215.14"
 PUBLIC_HOST = "shop.example.com"
 INTERNAL_DNS = {
+    "backend": ["172.18.0.5"],
+    "worker": ["172.18.0.6"],
+    "compose-redis-1": ["172.18.0.2"],
+    "host.docker.internal": ["192.168.65.254"],
+    "ipv6-only.internal": ["fd00::5"],
+    "metadata.internal": ["169.254.169.254"],
 }
 FAKE_DNS = {**INTERNAL_DNS, PUBLIC_HOST: ["172.18.0.7", PUBLIC_IP]}
 SSH_SETTINGS = {"host": PUBLIC_HOST, "username": "root", "password": "password"}
@@ -404,179 +1882,985 @@ INTERNAL_HOSTS = ("", "localhost", "127.0.0.1", "0x7f000001", "::1", "10.0.0.1",
 
 
 def make_addrinfo(*addresses: str) -> list[Any]:
-    pass  # TODO: implement
+    return [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, 0, 0, 0))
+        if ":" in address
+        else (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 0))
+        for address in addresses
+    ]
 
 
 @pytest.fixture
 def fake_dns(mocker: pytest_mock.MockerFixture) -> None:
-    pass  # TODO: implement
+    real_getaddrinfo = socket.getaddrinfo
 
     def getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
-        pass  # TODO: implement
+        if host not in FAKE_DNS:
+            return real_getaddrinfo(host, *args, **kwargs)
+        return make_addrinfo(*FAKE_DNS[host])
 
+    mocker.patch("socket.getaddrinfo", getaddrinfo)
 
 
 @pytest.mark.usefixtures("fake_dns")
 async def test_configurator(app: FastAPI, client: TestClient, token: str, mocker: pytest_mock.MockerFixture) -> None:
+    assert (await client.post("/configurator/deploy")).status_code == 422
+    assert (
+        await client.post(
+            "/manage/policies",
+            json={"allow_anonymous_configurator": False},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await client.post("/configurator/deploy", json=static_data.SCRIPT_SETTINGS)).status_code == 422
+    assert (
+        await client.post(
+            "/manage/policies",
+            json={"allow_anonymous_configurator": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    resp = await client.post("/configurator/deploy", json=static_data.SCRIPT_SETTINGS)
+    assert resp.status_code == 200
+    assert resp.json()["success"]
+    script = resp.json()["output"]
+    assert "sudo su -" in script
+    assert f"git clone {DOCKER_REPO_URL} crypto-payment-processor-docker" in script
+    assert "BITCART_CRYPTOS=btc" in script
+    assert "BITCART_HOST=crypto-payment-processor.ai" in script
+    assert "BTC_NETWORK=testnet" in script
+    assert "BTC_LIGHTNING=true" in script
+    assert "BITCART_ADDITIONAL_COMPONENTS=custom,tor" in script
+    deploy_settings = static_data.SCRIPT_SETTINGS.copy()
+    deploy_settings["mode"] = "Remote"
+    assert (await client.post("/configurator/deploy", json=deploy_settings)).status_code == 422
+    publish = mocker.patch.object(await app.state.dishka_container.get(TasksBroker), "publish")
+    deploy_settings["ssh_settings"] = SSH_SETTINGS
+    resp = await client.post("/configurator/deploy", json=deploy_settings)
+    publish.assert_called_once()
+    assert (await client.get("/configurator/deploy-result/1")).status_code == 404
+    assert resp.status_code == 200
+    assert not resp.json()["success"]
+    deploy_id = resp.json()["id"]
+    resp2 = await client.get(f"/configurator/deploy-result/{deploy_id}")
+    assert resp2.status_code == 200
+    data = resp2.json()
+    assert not data["success"]
+    assert data["id"] == deploy_id
+    deploy_settings = static_data.SCRIPT_SETTINGS.copy()
+    deploy_settings["mode"] = "Current"
+    assert (await client.post("/configurator/deploy", json=deploy_settings)).status_code == 401
+    resp = await client.post("/configurator/deploy", json=deploy_settings, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert not resp.json()["success"]
+    deploy_id = resp.json()["id"]
+    resp2 = await client.get(f"/configurator/deploy-result/{deploy_id}")
+    assert resp2.status_code == 200
+    data = resp2.json()
+    assert not data["success"]
+    assert data["id"] == deploy_id
 
 
 async def test_supported_cryptos(client: TestClient) -> None:
+    resp = await client.get("/cryptos/supported")
+    assert resp.status_code == 200
+    assert resp.json() == SUPPORTED_CRYPTOS
 
 
 @pytest.mark.usefixtures("fake_dns")
 async def test_get_server_settings(client: TestClient, token: str, mocker: pytest_mock.MockerFixture) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (await client.get("/configurator/server-settings")).status_code == 405
+    assert (await client.post("/configurator/server-settings")).status_code == 401
+    for host in INTERNAL_HOSTS:
+        assert (await client.post("/configurator/server-settings", json={"host": host})).status_code == 422
+    connect = mocker.patch("paramiko.SSHClient.connect", side_effect=paramiko.AuthenticationException)
+    resp = await client.post("/configurator/server-settings", json=SSH_SETTINGS)
+    assert resp.status_code == 200
+    assert resp.json() == static_data.FALLBACK_SERVER_SETTINGS
+    connect.assert_called_once()
+    assert connect.call_args.kwargs["hostname"] == PUBLIC_IP
+    assert connect.call_args.kwargs["port"] == 22
+    await client.post("/manage/policies", json={"allow_anonymous_configurator": False}, headers=headers)
+    assert (await client.post("/configurator/server-settings", json=SSH_SETTINGS)).status_code == 422
+    assert connect.call_count == 1
+    assert (await client.post("/configurator/server-settings", json=SSH_SETTINGS, headers=headers)).status_code == 200
+    assert connect.call_count == 2
+    resp = await client.post("/configurator/server-settings", headers=headers)
+    assert resp.status_code == 503
 
 
 async def test_get_server_settings_dns_rebinding(client: TestClient, mocker: pytest_mock.MockerFixture) -> None:
+    real_getaddrinfo = socket.getaddrinfo
+    answers = [make_addrinfo(PUBLIC_IP), make_addrinfo("127.0.0.1")]
 
     def getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
-        pass  # TODO: implement
+        if host != "rebind.example.com":
+            return real_getaddrinfo(host, *args, **kwargs)
+        return answers.pop(0)
 
+    mocker.patch("socket.getaddrinfo", getaddrinfo)
+    connect = mocker.patch("paramiko.SSHClient.connect")
+    resp = await client.post("/configurator/server-settings", json={"host": "rebind.example.com"})
+    assert resp.status_code == 200
+    assert resp.json() == static_data.FALLBACK_SERVER_SETTINGS
+    connect.assert_not_called()
+    assert answers == []
 
 
 async def test_configurator_ssh_rate_limit(app: FastAPI, client: TestClient, mocker: pytest_mock.MockerFixture) -> None:
+    redis_pool = await app.state.dishka_container.get(Redis)
 
+    async def clear_rate_limits() -> None:
+        async for key in redis_pool.scan_iter(f"{SSH_RATE_KEY}:*"):
+            await redis_pool.delete(key)
 
+    mocker.patch.object(Settings, "is_testing", return_value=False)
+    await clear_rate_limits()
+    try:
+        for _ in range(CONFIGURATOR_SSH_MAX_ATTEMPTS):
+            assert (await client.post("/configurator/server-settings", json={"host": "localhost"})).status_code == 422
+        assert (await client.post("/configurator/server-settings", json={"host": "localhost"})).status_code == 429
+        deploy_settings = {**static_data.SCRIPT_SETTINGS, "mode": "Remote", "ssh_settings": {"host": "localhost"}}
+        assert (await client.post("/configurator/deploy", json=deploy_settings)).status_code == 429
+        manual_settings = {**static_data.SCRIPT_SETTINGS, "mode": "Manual"}
+        assert (await client.post("/configurator/deploy", json=manual_settings)).status_code == 200
+    finally:
+        await clear_rate_limits()
 
 
 async def test_unauthorized_m2m_access(
+    client: TestClient, token: str, limited_user: dict[str, Any], wallet: dict[str, Any]
 ) -> None:
+    wallet_id = wallet["id"]
+    # No unauthorized anonymous access
+    assert (await client.post("/stores", json={"name": "new store", "wallets": [wallet_id]})).status_code == 401
+    # The actual owner can operate related objects
+    resp = await client.post(
+        "/stores", json={"name": "new store", "wallets": [wallet_id]}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    store_id = resp.json()["id"]
+    await client.delete(f"/stores/{store_id}", headers={"Authorization": f"Bearer {token}"})
+    token_usual = (
+        await client.post(
+            "/token",
+            json={"email": limited_user["email"], "password": static_data.USER_PWD, "permissions": ["full_control"]},
+        )
+    ).json()["access_token"]
+    assert (
+        await client.post(
+            "/stores", json={"name": "new store", "wallets": ["2"]}, headers={"Authorization": f"Bearer {token_usual}"}
+        )
+    ).status_code == 403  # Can't access other users' related objects
 
 
 async def get_wallet_balances(client: TestClient, token: str) -> str:
+    return (await client.get("/wallets/balance", headers={"Authorization": f"Bearer {token}"})).json()["balance"]
 
 
 async def test_users_display_balance(client: TestClient, token: str, wallet: dict[str, Any], mock_btc_balance: Any) -> None:
+    assert Decimal(await get_wallet_balances(client, token)) > 1
+    assert (await client.post("/users/me/settings")).status_code == 401
+    resp = await client.post(
+        "/users/me/settings", json={"balance_currency": "BTC"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    # Changes only the settings provided
+    default_values = UserPreferences().model_dump()
+    assert resp.json()["settings"] == {**default_values, "balance_currency": "BTC"}
+    assert float(await get_wallet_balances(client, token)) == 1.5
+    resp = await client.post(
+        "/users/me/settings",
+        json={"balance_currency": "USD"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["settings"] == default_values
+    assert Decimal(await get_wallet_balances(client, token)) > 1
 
 
 async def test_invoice_products_access_control(client: TestClient) -> None:
+    user1 = await create_user(client)
+    token1 = (await create_token(client, user1))["access_token"]
+    user2 = await create_user(client, token=token1)
+    token2 = (await create_token(client, user2))["access_token"]
+    product1 = await create_product(client, token1)
+    product2 = await create_product(client, token2)
+    store_id1 = product1["store_id"]
+    store_id2 = product2["store_id"]
+    product_id1 = product1["id"]
+    product_id2 = product2["id"]
+    assert (
+        await client.post("/invoices", json={"price": 5, "store_id": store_id1, "products": [product_id1]})
+    ).status_code == 200
+    assert (
+        await client.post("/invoices", json={"price": 5, "store_id": store_id1, "products": [product_id2]})
+    ).status_code == 403
+    assert (
+        await client.post("/invoices", json={"price": 5, "store_id": store_id2, "products": [product_id2]})
+    ).status_code == 200
+    assert (
+        await client.post("/invoices", json={"price": 5, "store_id": store_id2, "products": [product_id1]})
+    ).status_code == 403
 
 
 async def test_wallets_labels(client: TestClient, token: str) -> None:
+    wallet1_id = (await create_wallet(client, token))["id"]
+    wallet2_id = (await create_wallet(client, token, label="customlabel"))["id"]
+    resp = await client.post(
+        "/stores",
+        json={"name": "Multiple Currency", "wallets": [wallet1_id, wallet2_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    store_id = resp.json()["id"]
+    resp = await client.post("/invoices", json={"price": 5, "store_id": store_id})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["payments"]) == 2
+    assert data["payments"][0]["name"] == "BTC"
+    assert data["payments"][1]["name"] == "customlabel"
 
 
 async def test_backup_providers(client: TestClient) -> None:
+    resp = await client.get("/manage/backups/providers")
+    assert resp.status_code == 200
+    assert resp.json() == BACKUP_PROVIDERS
 
 
 async def test_backup_frequencies(client: TestClient) -> None:
+    resp = await client.get("/manage/backups/frequencies")
+    assert resp.status_code == 200
+    assert resp.json() == BACKUP_FREQUENCIES
 
 
 async def test_backup_policies(client: TestClient, token: str) -> None:
+    assert (await client.get("/manage/backups")).status_code == 401
+    resp = await client.get("/manage/backups", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "provider": "local",
+        "scheduled": False,
+        "frequency": "weekly",
+        "environment_variables": {},
+    }
+    assert (await client.post("/manage/backups")).status_code == 401
+    resp = await client.post(
+        "/manage/backups",
+        json={"scheduled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "provider": "local",
+        "scheduled": True,
+        "frequency": "weekly",
+        "environment_variables": {},
+    }
 
 
 async def test_products_pagination_deleted_store(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    product = await create_product(client, token, store_id=store["id"])
+    assert (await client.get("/products")).status_code == 401
+    resp = await client.get("/products", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["result"][0] == product
+    new_resp = {**product, "store_id": None}
+    await client.delete(f"/stores/{store['id']}", headers={"Authorization": f"Bearer {token}"})
+    resp = await client.get("/products", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["result"][0] == new_resp
 
 
 @pytest.mark.parametrize(
+    ("name", "expected", "updated"),
+    [
+        ("buyer_email", "test@example.com", "test2@example.com"),
+        ("shipping_address", "test", "test2"),
+        ("notes", "test", "test2"),
+    ],
 )
 async def test_invoice_update_customer(client: TestClient, token: str, name: str, expected: str, updated: str) -> None:
+    invoice = await create_invoice(client, token)
+    invoice_id = invoice["id"]
+    assert (await client.patch(f"/invoices/{invoice_id}")).status_code == 401
+    assert (await client.patch(f"/invoices/{invoice_id}/customer")).status_code == 422
+    assert (await client.patch("/invoices/test/customer", json={name: expected})).status_code == 404
+    # Can edit only allowed fields
+    assert (await client.patch(f"/invoices/{invoice_id}/customer", json={"price": 1})).json()["price"] == invoice["price"]
+    # Empty string is treated normally
+    assert (await client.patch(f"/invoices/{invoice_id}/customer", json={"buyer_email": ""})).json()["buyer_email"] == ""
+    resp = await client.patch(f"/invoices/{invoice_id}/customer", json={name: expected})
+    assert resp.status_code == 200
+    assert resp.json()[name] == expected
+    # when set, don't change anymore
+    assert (await client.patch(f"/invoices/{invoice_id}/customer", json={name: updated})).json()[name] == expected
 
 
 async def test_get_tokens_btc(client: TestClient) -> None:
+    resp = await client.get("/cryptos/tokens/btc")
+    assert resp.status_code == 200
+    assert resp.json() == {"count": 0, "result": [], "previous": None, "next": None}
+    resp = await client.get("/cryptos/tokens/btc/abi")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
 
 class NotRunningBTC:
-    pass  # TODO: implement
+    coin_name = "BTC"
 
     class server:
-        pass  # TODO: implement
+        @staticmethod
         def getinfo() -> None:
-            pass  # TODO: implement
+            raise BitcartBaseError("Not running")
 
 
 async def test_syncinfo(client: TestClient, token: str, mocker: pytest_mock.MockerFixture) -> None:
     def find_element(elements: list[dict[str, Any]], name: str) -> dict[str, Any]:
-        pass  # TODO: implement
+        for element in elements:
+            if element["currency"] == name:
+                return element
+        raise ValueError(f"Element {name} not found")
 
+    assert (await client.get("/manage/syncinfo")).status_code == 401
+    resp = await client.get("/manage/syncinfo", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) > 0
+    item = find_element(data, "BTC")
+    assert item["running"] is True
+    assert item["synchronized"] is True
+    assert item["blockchain_height"] > 0
+    mocker.patch("api.services.coins.CoinService.cryptos", {"btc": NotRunningBTC()})
+    data = (await client.get("/manage/syncinfo", headers={"Authorization": f"Bearer {token}"})).json()
+    item = find_element(data, "BTC")
+    assert item["running"] is False
 
 
 async def test_create_invoice_randomize_wallets(client: TestClient, token: str) -> None:
+    wallets = [await create_wallet(client, token, xpub=xpub) for xpub in static_data.RANDOMIZE_TEST_XPUBS]
+    store = await create_store(client, token, custom_store_attrs={"wallets": [x["id"] for x in wallets]})
+    invoice = await create_invoice(client, token, store_id=store["id"])
+    payments = invoice["payments"]
+    for idx, payment in enumerate(payments):
+        assert payment["name"] == f"BTC ({idx + 1})"
+    await client.patch(
+        f"/stores/{store['id']}/checkout_settings",
+        json={"randomize_wallet_selection": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    invoice = await create_invoice(client, token, store_id=store["id"])
+    assert len(invoice["payments"]) == 1
+    assert invoice["payments"][0]["name"] == "BTC"
+    is_mine_ok: dict[int, bool] = defaultdict(bool)
+    while True:
+        invoice = await create_invoice(client, token, store_id=store["id"])
+        address = invoice["payments"][0]["payment_address"]
+        for wallet, xpub in enumerate(static_data.RANDOMIZE_TEST_XPUBS):
+            is_mine_ok[wallet] |= await BTC(xpub=xpub, rpc_url=MAIN_URL).server.ismine(address)
+        if all(is_mine_ok.values()):
+            break
 
 
 async def test_get_default_explorer(client: TestClient) -> None:
+    assert (await client.get("/cryptos/explorer/test")).status_code == 422
+    resp = await client.get("/cryptos/explorer/btc")
+    assert resp.status_code == 200
+    assert resp.json() == static_data.DEFAULT_EXPLORER
+    assert (await client.get("/cryptos/explorer/BTC")).json() == resp.json()
 
 
 async def test_get_default_rpc(client: TestClient) -> None:
+    assert (await client.get("/cryptos/rpc/test")).status_code == 422
+    resp = await client.get("/cryptos/rpc/btc")
+    assert resp.status_code == 200
+    assert resp.json() == ""
+    assert (await client.get("/cryptos/rpc/BTC")).json() == resp.json()
 
 
 async def test_invoices_authorized_access(client: TestClient, store: dict[str, Any], token: str) -> None:
+    assert (await client.post("/invoices", json={"price": 1, "store_id": store["id"]})).status_code == 200
+    assert (
+        await client.patch(
+            f"/stores/{store['id']}/checkout_settings",
+            json={"allow_anonymous_invoice_creation": False},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await client.post("/invoices", json={"price": 1, "store_id": store["id"]})).status_code == 403
 
 
 async def test_wallet_schema(client: TestClient) -> None:
+    resp = await client.get("/wallets/schema")
+    assert resp.status_code == 200
+    assert resp.json() == {"btc": {"required": [], "properties": [], "xpub_name": "Xpub"}}
 
 
 async def test_invoices_payment_details(client: TestClient, token: str) -> None:
+    invoice = await create_invoice(client, token)
+    invoice_id = invoice["id"]
+    payment_id = invoice["payments"][0]["id"]
+    assert (await client.patch(f"/invoices/{invoice_id}/details")).status_code == 422
+    assert (
+        await client.patch(f"/invoices/{invoice_id}/details", json={"id": payment_id, "address": "test"})
+    ).status_code == 422
+    assert (
+        await client.patch(
+            f"/invoices/{invoice['id']}/details",
+            json={"id": "test", "address": static_data.PAYOUT_DESTINATION},
+        )
+    ).status_code == 404
+    assert (
+        await client.patch(
+            f"/invoices/{invoice_id}/details", json={"id": payment_id, "address": static_data.PAYOUT_DESTINATION}
+        )
+    ).status_code == 422  # unsupported in BTC
+    invoice = await create_invoice(client, token)
+    assert (
+        await client.post(
+            "/invoices/batch",
+            json={"ids": [invoice["id"]], "command": "mark_complete"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (
+        await client.patch(
+            f"/invoices/{invoice['id']}/details",
+            json={"id": invoice["payments"][0]["id"], "address": static_data.PAYOUT_DESTINATION},
+        )
+    ).status_code == 422
 
 
 async def test_ping_server_mail(client: TestClient, token: str) -> None:
+    assert (await client.get("/manage/testping")).status_code == 401
+    resp = await client.get("/manage/testping", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert not resp.json()
 
 
 async def test_password_reset(client: TestClient, user: dict[str, Any], token: str, mocker: pytest_mock.MockerFixture) -> None:
+    auth_code = None
 
     def func(url: str, code: str) -> None:
-        pass  # TODO: implement
+        nonlocal auth_code
+        auth_code = code
 
+    mocker.patch("api.utils.email.Email.is_enabled", return_value=True)
+    mocker.patch("api.utils.email.Email.send_mail", return_value=True)
+    mocker.patch("api.utils.routing.get_redirect_url", side_effect=func)
+    assert (
+        await client.post("/users/reset_password", json={"email": "notexisting@gmail.com", "next_url": "https://example.com"})
+    ).status_code == 200
+    assert (
+        await client.post("/users/reset_password", json={"email": user["email"], "next_url": "https://example.com"})
+    ).status_code == 200
+    assert auth_code is not None
+    assert (
+        await client.post("/users/reset_password/finalize", json={"code": "notexisting", "password": "12345678"})
+    ).status_code == 422
+    assert (
+        await client.post("/users/reset_password/finalize", json={"code": auth_code, "password": "12345678"})
+    ).status_code == 200
+    assert (
+        await client.post("/users/reset_password/finalize", json={"code": auth_code, "password": "12345678"})
+    ).status_code == 422
+    assert (await client.get("/users/me", headers={"Authorization": f"Bearer {token}"})).status_code == 401
+    assert (await client.post("/token", json={"email": user["email"], "password": static_data.USER_PWD})).status_code == 401
+    assert (await client.post("/token", json={"email": user["email"], "password": "12345678"})).status_code == 200
 
 
 async def test_products_quantity_management(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    store_id = store["id"]
+    product1 = await create_product(client, token, store_id=store_id, quantity=-1)
+    product2 = await create_product(client, token, store_id=store_id, quantity=5)
+    invoice1 = await create_invoice(client, token, store_id=store_id, products=[product1["id"]])
+    invoice2 = await create_invoice(client, token, store_id=store_id, products=[product2["id"]])
+    await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice1["id"]], "command": "mark_complete"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice2["id"]], "command": "mark_complete"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert (await client.get(f"/products/{product1['id']}")).json()["quantity"] == -1
+    assert (await client.get(f"/products/{product2['id']}")).json()["quantity"] == 4
+    assert (
+        await client.post("/invoices", json={"price": 1, "store_id": store_id, "products": {product2["id"]: 10}})
+    ).status_code == 422  # disallow creating invoice with too much stock
 
 
 async def test_configurator_dns_resolve(client: TestClient, token: str) -> None:
+    assert (await client.get("/configurator/dns-resolve?name=test")).json() is False
+    assert (await client.get("/configurator/dns-resolve?name=example.com")).json() is True
+    assert (await client.get(f"/configurator/dns-resolve?name={'a' * 254}")).status_code == 422
+    headers = {"Authorization": f"Bearer {token}"}
+    await client.post("/manage/policies", json={"allow_anonymous_configurator": False}, headers=headers)
+    assert (await client.get("/configurator/dns-resolve?name=example.com")).status_code == 422
+    assert (await client.get("/configurator/dns-resolve?name=example.com", headers=headers)).json() is True
 
 
 @pytest.mark.usefixtures("fake_dns")
 async def test_configurator_dns_resolve_hides_internal_names(client: TestClient) -> None:
+    for name in INTERNAL_HOSTS:
+        assert (await client.get("/configurator/dns-resolve", params={"name": name})).json() is False
+    assert (await client.get("/configurator/dns-resolve", params={"name": PUBLIC_HOST})).json() is True
 
 
 async def test_tfa_flow(client: TestClient, user: dict[str, Any], token: str) -> None:
+    original_token = token
+    assert (
+        await client.post("/users/2fa/totp/verify", json={"code": "wrong"}, headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 422
+    resp = await client.post(
+        "/users/2fa/totp/verify",
+        json={"code": pyotp.TOTP(user["totp_key"]).now()},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()) == 10
+    recovery_code = resp.json()[0]
+    response_token = (await client.post("/token", json={"email": user["email"], "password": static_data.USER_PWD})).json()
+    assert response_token["tfa_required"] is True
+    assert response_token["tfa_types"] == ["totp"]
+    assert (
+        await client.post("/token/2fa/totp", json={"token": "wrong", "code": pyotp.TOTP(user["totp_key"]).now()})
+    ).status_code == 422
+    assert (
+        await client.post("/token/2fa/totp", json={"token": response_token["tfa_code"], "code": "wrong"})
+    ).status_code == 422
+    resp = await client.post(
+        "/token/2fa/totp", json={"token": response_token["tfa_code"], "code": pyotp.TOTP(user["totp_key"]).now()}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["tfa_required"] is False
+    assert len(resp.json()["access_token"]) == len(original_token)
+    assert (
+        await client.post(
+            "/token/2fa/totp", json={"token": response_token["tfa_code"], "code": pyotp.TOTP(user["totp_key"]).now()}
+        )
+    ).status_code == 422
+    response_token = (await client.post("/token", json={"email": user["email"], "password": static_data.USER_PWD})).json()
+    assert (
+        await client.post("/token/2fa/totp", json={"token": response_token["tfa_code"], "code": recovery_code})
+    ).status_code == 200
+    assert (
+        await client.post("/token/2fa/totp", json={"token": response_token["tfa_code"], "code": recovery_code})
+    ).status_code == 422
+    assert (await client.post("/users/2fa/disable", headers={"Authorization": f"Bearer {original_token}"})).status_code == 200
+    assert (await client.post("/token", json={"email": user["email"], "password": static_data.USER_PWD})).json()[
+        "tfa_required"
+    ] is False
 
 
 async def test_verify_email(client: TestClient, user: dict[str, Any], token: str, mocker: pytest_mock.MockerFixture) -> None:
+    assert user["is_verified"] is False
+    auth_code = None
 
     def func(url: str, code: str) -> None:
-        pass  # TODO: implement
+        nonlocal auth_code
+        auth_code = code
 
+    mocker.patch("api.utils.email.Email.is_enabled", return_value=True)
+    mocker.patch("api.utils.email.Email.send_mail", return_value=True)
+    mocker.patch("api.utils.routing.get_redirect_url", side_effect=func)
+    assert (
+        await client.post("/users/verify", json={"email": "notexisting@gmail.com", "next_url": "https://example.com"})
+    ).status_code == 200
+    assert (
+        await client.post("/users/verify", json={"email": user["email"], "next_url": "https://example.com"})
+    ).status_code == 200
+    assert auth_code is not None
+    assert (await client.post("/users/verify/finalize", json={"code": "notexisting"})).status_code == 422
+    assert (await client.post("/users/verify/finalize", json={"code": auth_code})).status_code == 200
+    assert (await client.post("/users/verify/finalize", json={"code": auth_code})).status_code == 422
+    assert (await client.get("/users/me", headers={"Authorization": f"Bearer {token}"})).json()["is_verified"] is True
+    assert (await client.post("/users/verify", json={"email": user["email"], "next_url": "https://example.com"})).json()[
+        "detail"
+    ] == "User is already verified"
 
 
 async def test_token_verification(client: TestClient, user: dict[str, Any], token: str) -> None:
+    assert (
+        await client.post("/token", json={"email": "testsuperuser@example.com", "password": static_data.USER_PWD})
+    ).status_code == 200
+    await client.post(
+        "/manage/policies",
+        json={"require_verified_email": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert (await client.post("/token", json={"email": "testsuperuser@example.com", "password": static_data.USER_PWD})).json()[
+        "detail"
+    ] == "Email is not verified"
+    assert (
+        await client.patch(f"/users/{user['id']}", json={"is_enabled": False}, headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 200
+    assert (await client.post("/token", json={"email": "testsuperuser@example.com", "password": static_data.USER_PWD})).json()[
+        "detail"
+    ] == "Account is disabled"
+    assert (
+        await client.patch(f"/users/{user['id']}", json={"is_enabled": True}, headers={"Authorization": f"Bearer {token}"})
+    ).json()["detail"] == "Account is disabled"
 
 
 async def test_reset_password(client: TestClient, token: str) -> None:
+    assert (
+        await client.post(
+            "/users/password",
+            json={"old_password": "wrong", "password": "12345678"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 422
+    assert (
+        await client.post(
+            "/users/password",
+            json={"old_password": static_data.USER_PWD, "password": "12345678"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (
+        await client.post("/token", json={"email": "testsuperuser@example.com", "password": static_data.USER_PWD})
+    ).status_code == 401
 
 
 async def test_files_functionality(client: TestClient, token: str, limited_user: dict[str, Any], settings: Settings) -> None:
+    limited_token = (await create_token(client, limited_user, permissions=["file_management"]))["access_token"]
+    resp = await client.post("/files", files={"file": ("test.txt", b"test")}, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    file_id = resp.json()["id"]
+    stored_fname = f"{file_id}-{resp.json()['filename']}"
+    assert os.path.exists(os.path.join(settings.files_dir, stored_fname))
+    limited_resp = await client.post(
+        "/files", files={"file": ("test.txt", b"test")}, headers={"Authorization": f"Bearer {limited_token}"}
+    )
+    assert limited_resp.status_code == 200
+    limited_file_id = limited_resp.json()["id"]
+    assert (
+        await client.post("/manage/policies", json={"allow_file_uploads": False}, headers={"Authorization": f"Bearer {token}"})
+    ).status_code == 200
+    assert (
+        await client.post(
+            "/files", files={"file": ("test.txt", b"test")}, headers={"Authorization": f"Bearer {limited_token}"}
+        )
+    ).status_code == 403
+    assert (
+        await client.patch(
+            f"/files/{limited_file_id}",
+            files={"file": ("test.txt", b"test")},
+            headers={"Authorization": f"Bearer {limited_token}"},
+        )
+    ).status_code == 403
+    assert (
+        await client.patch(
+            f"/files/{file_id}", files={"file": ("test2.txt", b"test2")}, headers={"Authorization": f"Bearer {token}"}
+        )
+    ).status_code == 200
+    assert not os.path.exists(os.path.join(settings.files_dir, stored_fname))
+    stored_fname = f"{file_id}-test2.txt"
+    assert os.path.exists(os.path.join(settings.files_dir, stored_fname))
+    assert (
+        cast(HttpRequest, (await client.get(f"/files/handle/{file_id}")).next_request).url
+        == f"{settings.api_url}/files/localstorage/{stored_fname}"
+    )
+    assert (await client.delete(f"/files/{file_id}", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+    assert not os.path.exists(os.path.join(settings.files_dir, stored_fname))
+    assert (
+        await client.post(
+            "/files/batch",
+            json={"command": "delete", "ids": [limited_file_id]},
+            headers={"Authorization": f"Bearer {limited_token}"},
+        )
+    ).status_code == 200
+    assert not os.path.exists(os.path.join(settings.files_dir, f"{limited_file_id}-test.txt"))
 
 
 async def test_generate_wallet(client: TestClient, token: str) -> None:
+    resp1 = await client.post(
+        "/wallets/create", json={"currency": "btc", "hot_wallet": True}, headers={"Authorization": f"Bearer {token}"}
+    )
+    resp2 = await client.post(
+        "/wallets/create", json={"currency": "btc", "hot_wallet": False}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+    assert len(resp1.json()["seed"].split()) == len(resp2.json()["seed"].split()) == 12
+    assert resp1.json()["seed"] == resp1.json()["key"]
+    assert resp2.json()["key"].startswith("vpub")
 
 
 async def test_refund_functionality(client: TestClient, token: str, mocker: pytest_mock.MockerFixture, app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    invoice = await create_invoice(client, token, buyer_email="test@test.com")
+    invoice_id = invoice["id"]
+    assert (
+        await client.post(
+            f"/invoices/{invoice_id}/refunds",
+            json={"amount": 1, "currency": "USD", "send_email": True, "admin_host": "http://admin"},
+        )
+    ).status_code == 401
+    assert (
+        await client.post(
+            f"/invoices/{invoice_id}/refunds",
+            json={"amount": 1, "currency": "USD", "send_email": True, "admin_host": "http://admin"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 422  # invoice unpaid
+    await payment_processor.new_payment_handler(
+        DummyInstance(), None, invoice["payments"][0]["lookup_field"], "complete", None
+    )
+    full_url = ""
 
+    async def func(store: models.Store, invoice: models.Invoice, refund: models.Refund, refund_url: str) -> None:
+        nonlocal full_url
+        full_url = refund_url
 
+    mocker.patch("api.utils.email.Email.is_enabled", return_value=True)
+    mocker.patch("api.utils.email.Email.send_mail", return_value=True)
+    mocker.patch("api.services.crud.templates.TemplateService.get_customer_refund_template", side_effect=func)
+    resp = await client.post(
+        f"/invoices/{invoice_id}/refunds",
+        json={"amount": 1, "currency": "USD", "send_email": True, "admin_host": "http://admin"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    refund_id = resp.json()["id"]
+    assert full_url == f"http://admin/refunds/{refund_id}"
+    assert (await client.get(f"/invoices/refunds/{refund_id}")).json() == resp.json()
+    # submit refund address
+    assert (
+        await client.post(f"/invoices/refunds/{refund_id}/submit", json={"destination": "test"})
+    ).status_code == 422  # address validation
+    resp2 = await client.post(f"/invoices/refunds/{refund_id}/submit", json={"destination": static_data.PAYOUT_DESTINATION})
+    assert resp2.status_code == 200
+    assert (
+        await client.post(f"/invoices/refunds/{refund_id}/submit", json={"destination": static_data.PAYOUT_DESTINATION})
+    ).status_code == 422  # already submitted
+    assert (await client.get(f"/invoices/refunds/{refund_id}")).json() == resp2.json()
+    assert resp2.json()["payout_status"] == "pending"
+    assert resp2.json()["tx_hash"] is None
+    assert resp2.json()["wallet_currency"] == "btc"
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        refund_service = await container.get(RefundService)
+        refund = await refund_service.get(refund_id)
+    await mark_payout_sent(app, refund.payout_id, "test")
+    invoice = (await client.get(f"/invoices/{invoice_id}")).json()
+    assert invoice["status"] == "refunded"
+    resp2 = await client.get(f"/invoices/refunds/{refund_id}")
+    assert resp2.json()["payout_status"] == "sent"
+    assert resp2.json()["tx_hash"] == "test"
 
 
 async def test_refund_amount_rounded_down(client: TestClient, token: str, app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    headers = {"Authorization": f"Bearer {token}"}
+    invoice = await create_invoice(client, token)
+    await payment_processor.new_payment_handler(
+        DummyInstance(), None, invoice["payments"][0]["lookup_field"], "complete", None
+    )
+    refund_data = {"amount": "9.999", "currency": "USD", "send_email": False, "admin_host": "http://admin"}
+    refund = (await client.post(f"/invoices/{invoice['id']}/refunds", json=refund_data, headers=headers)).json()
+    assert refund["amount"] == "9.99"
+    destination = {"destination": static_data.PAYOUT_DESTINATION}
+    refund = (await client.post(f"/invoices/refunds/{refund['id']}/submit", json=destination)).json()
+    assert refund["amount"] == "9.99"
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        payout = await (await container.get(PayoutService)).get(refund["payout_id"])
+    assert payout.amount == Decimal("9.99")
 
 
 async def test_refund_with_deleted_invoice(client: TestClient, token: str, app: FastAPI) -> None:
+    payment_processor = await app.state.dishka_container.get(PaymentProcessor)
+    headers = {"Authorization": f"Bearer {token}"}
+    destination = {"destination": static_data.PAYOUT_DESTINATION}
+    invoice = await create_invoice(client, token)
+    await payment_processor.new_payment_handler(
+        DummyInstance(), None, invoice["payments"][0]["lookup_field"], "complete", None
+    )
+    refund_data = {"amount": 1, "currency": "USD", "send_email": False, "admin_host": "http://admin"}
+    submitted = (await client.post(f"/invoices/{invoice['id']}/refunds", json=refund_data, headers=headers)).json()
+    unsubmitted = (await client.post(f"/invoices/{invoice['id']}/refunds", json=refund_data, headers=headers)).json()
+    assert (await client.post(f"/invoices/refunds/{submitted['id']}/submit", json=destination)).status_code == 200
+    assert (await client.delete(f"/invoices/{invoice['id']}", headers=headers)).status_code == 200
+    other_invoice = await create_invoice(client, token)
+    resp = await client.post(f"/invoices/refunds/{unsubmitted['id']}/submit", json=destination)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Refund invoice was deleted"
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        refund = await (await container.get(RefundService)).get(submitted["id"])
+    await mark_payout_sent(app, cast(str, refund.payout_id), "test")
+    other_invoice = (await client.get(f"/invoices/{other_invoice['id']}", headers=headers)).json()
+    assert other_invoice["status"] == "pending"
+    assert (await client.get(f"/invoices/refunds/{submitted['id']}")).json()["invoice_id"] is None
+    assert (await client.delete(f"/wallets/{submitted['wallet_id']}", headers=headers)).status_code == 200
+    assert (await client.get(f"/invoices/refunds/{submitted['id']}")).json()["wallet_id"] is None
 
 
 async def test_wallet_symbol(client: TestClient, token: str, wallet: dict[str, Any]) -> None:
+    response = await client.get(f"/wallets/{wallet['id']}/symbol", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json() == "btc"
+    response = await client.get(f"/wallets/{wallet['id']}/symbol")
+    assert response.status_code == 401
+    response = await client.get("/wallets/non-existent/symbol", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 404
 
 
 async def test_invoice_custom_payment_methods(client: TestClient, token: str) -> None:
+    wallet1 = await create_wallet(client, token)
+    wallet2 = await create_wallet(client, token)
+    wallet3 = await create_wallet(client, token)
+    store = await create_store(client, token, custom_store_attrs={"wallets": [wallet1["id"], wallet2["id"], wallet3["id"]]})
+    store_id = store["id"]
+    resp = await client.post("/invoices", json={"store_id": store_id, "price": 10})
+    assert resp.status_code == 200
+    invoice_default = resp.json()
+    assert "payment_methods" in invoice_default
+    assert set(invoice_default["payment_methods"]) == {wallet1["id"], wallet2["id"], wallet3["id"]}
+    assert len(invoice_default["payments"]) == 3
+    payment_wallet_ids = {payment["wallet_id"] for payment in invoice_default["payments"]}
+    assert payment_wallet_ids == {wallet1["id"], wallet2["id"], wallet3["id"]}
+    resp = await client.post(
+        "/invoices",
+        json={"store_id": store_id, "price": 10, "payment_methods": [wallet1["id"], wallet2["id"]]},
+    )
+    assert resp.status_code == 200
+    invoice_custom = resp.json()
+    assert "payment_methods" in invoice_custom
+    assert invoice_custom["payment_methods"] == [wallet1["id"], wallet2["id"]]
+    assert len(invoice_custom["payments"]) == 2
+    for idx, payment in enumerate(invoice_custom["payments"]):
+        assert payment["wallet_id"] == invoice_custom["payment_methods"][idx]
+    resp = await client.post("/invoices", json={"store_id": store_id, "price": 10, "payment_methods": [wallet3["id"]]})
+    assert resp.status_code == 200
+    invoice_single = resp.json()
+    assert invoice_single["payment_methods"] == [wallet3["id"]]
+    assert len(invoice_single["payments"]) == 1
+    assert invoice_single["payments"][0]["wallet_id"] == wallet3["id"]
+    resp = await client.post("/invoices", json={"store_id": store_id, "price": 10, "payment_methods": []})
+    assert resp.status_code == 422
+    assert "Payment methods cannot be empty" in resp.json()["detail"]
+    other_wallet = await create_wallet(client, token)
+    resp = await client.post(
+        "/invoices",
+        json={"store_id": store_id, "price": 10, "payment_methods": [other_wallet["id"]]},
+    )
+    assert resp.status_code == 422
+    assert "not connected to store" in resp.json()["detail"]
+    resp = await client.post(
+        "/invoices",
+        json={"store_id": store_id, "price": 10, "payment_methods": [wallet1["id"], other_wallet["id"]]},
+    )
+    assert resp.status_code == 422
+    assert "not connected to store" in resp.json()["detail"]
+    resp = await client.get(f"/invoices/{invoice_custom['id']}")
+    assert resp.status_code == 200
+    retrieved_invoice = resp.json()
+    assert retrieved_invoice["payment_methods"] == [wallet1["id"], wallet2["id"]]
+    for idx, payment in enumerate(retrieved_invoice["payments"]):
+        assert payment["wallet_id"] == retrieved_invoice["payment_methods"][idx]
 
 
 @pytest.mark.parametrize(
+    "select_idx,custom_amount,tx_hashes", [(None, None, None), (1, None, None), (0, 0.12345678, ["a", "b"])]
 )
 async def test_mark_complete_cases(
+    client: TestClient,
+    token: str,
+    app: FastAPI,
+    select_idx: int | None,
+    custom_amount: float | None,
+    tx_hashes: list[str] | None,
 ) -> None:
+    wallet1 = (await create_wallet(client, token))["id"]
+    wallet2 = (await create_wallet(client, token))["id"]
+    store = await create_store(client, token, custom_store_attrs={"wallets": [wallet1, wallet2]})
+    invoice = await create_invoice(client, token, store_id=store["id"])
+    async with app.state.dishka_container(scope=Scope.SESSION) as container:
+        service = await container.get(InvoiceService)
+        method = await service.get(invoice["id"])
+    options = {}
+    expected_method_id = method.payments[0].id if select_idx is None else method.payments[select_idx].id
+    if select_idx is not None:
+        options["payment_method_id"] = expected_method_id
+    expected_amount = float(method.payments[0].amount if select_idx is None else method.payments[select_idx].amount)
+    if custom_amount is not None:
+        options["sent_amount"] = custom_amount
+        expected_amount = custom_amount
+    if tx_hashes is not None:
+        options["tx_hashes"] = tx_hashes
+    await client.post(
+        "/invoices/batch",
+        json=(
+            {"ids": [invoice["id"]], "command": "mark_complete"}
+            if not options
+            else {"ids": [invoice["id"]], "command": "mark_complete", "options": options}
+        ),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    j = (await client.get(f"/invoices/{invoice['id']}", headers={"Authorization": f"Bearer {token}"})).json()
+    assert j["payment_id"] == expected_method_id
+    assert Decimal(j["sent_amount"]) == Decimal(str(expected_amount))
+    if tx_hashes is not None:
+        assert j["tx_hashes"] == tx_hashes
 
 
 @pytest.mark.parametrize(
+    ("options", "tx_hashes", "sent_amount", "transactions"),
+    [
+        (
+            {"tx_amounts": {"tx1": "0.06", "tx2": "0.04"}},
+            ["tx1", "tx2"],
+            "0.10000000",
+            [{"tx_hash": "tx1", "amount": "0.06000000"}, {"tx_hash": "tx2", "amount": "0.04000000"}],
+        ),
+        ({"tx_hashes": ["tx1"], "sent_amount": "0.05"}, ["tx1"], "0.05000000", [{"tx_hash": "tx1", "amount": "0.05000000"}]),
+        (
+            {"tx_hashes": ["tx1", "tx2"]},
+            ["tx1", "tx2"],
+            "0.10000000",
+            [{"tx_hash": "tx1", "amount": None}, {"tx_hash": "tx2", "amount": None}],
+        ),
+        ({}, [], "0.10000000", []),
+    ],
 )
 async def test_mark_complete_transactions(
+    client: TestClient,
+    token: str,
+    store: dict[str, Any],
+    options: dict[str, Any],
+    tx_hashes: list[str],
+    sent_amount: str,
+    transactions: list[dict[str, str | None]],
 ) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    invoice = await create_invoice(client, token, store_id=store["id"], price=5000)
+    resp = await client.post(
+        "/invoices/batch", json={"ids": [invoice["id"]], "command": "mark_complete", "options": options}, headers=headers
+    )
+    assert resp.status_code == 200
+    invoice = (await client.get(f"/invoices/{invoice['id']}", headers=headers)).json()
+    assert (invoice["tx_hashes"], invoice["sent_amount"]) == (tx_hashes, sent_amount)
+    assert invoice["transactions"] == transactions
 
 
 async def test_mark_complete_validation(client: TestClient, token: str, store: dict[str, Any]) -> None:
+    invoice1 = await create_invoice(client, token, store_id=store["id"])
+    invoice2 = await create_invoice(client, token, store_id=store["id"])
+    resp = await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice1["id"], invoice2["id"]], "command": "mark_complete", "options": [{}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422
+    assert "When options is a list, it must have the same length" in resp.json()["detail"]
+    resp = await client.post(
+        "/invoices/batch",
+        json={"ids": [invoice1["id"]], "command": "mark_complete", "options": {"payment_method_id": "does-not-exist"}},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422
+    assert "Payment method does-not-exist not found" in resp.json()["detail"]

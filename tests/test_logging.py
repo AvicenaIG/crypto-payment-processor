@@ -18,77 +18,135 @@ from api.settings import Settings
 
 @pytest.fixture(scope="session")
 def otel_exporter() -> InMemoryLogRecordExporter:
-    pass  # TODO: implement
+    exporter = InMemoryLogRecordExporter()
+    provider = LoggerProvider()
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    set_logger_provider(provider)
+    trace.set_tracer_provider(TracerProvider())
+    return exporter
 
 
 @pytest.fixture
 def exported(settings: Settings, otel_exporter: InMemoryLogRecordExporter) -> Iterator[InMemoryLogRecordExporter]:
-    pass  # TODO: implement
+    otel_exporter.clear()
+    structlog.reset_defaults()
+    configure_logging(settings=settings.model_copy(update={"OTEL_ENABLED": True}))
+    yield otel_exporter
+    structlog.reset_defaults()
+    configure_logging(settings=settings)
 
 
 @pytest.fixture
 def logger(request: pytest.FixtureRequest, exported: InMemoryLogRecordExporter) -> Logger:
-    pass  # TODO: implement
+    return get_logger(f"tests.{request.node.name}")
 
 
 def only_record(exported: InMemoryLogRecordExporter) -> LogRecord:
-    pass  # TODO: implement
+    records = exported.get_finished_logs()
+    assert len(records) == 1
+    return records[0].log_record
 
 
 def only_scope(exported: InMemoryLogRecordExporter) -> str:
-    pass  # TODO: implement
+    records = exported.get_finished_logs()
+    assert len(records) == 1
+    scope = records[0].instrumentation_scope
+    assert scope is not None
+    return scope.name
 
 
 def only_attributes(exported: InMemoryLogRecordExporter) -> Mapping[str, AnyValue]:
-    pass  # TODO: implement
+    attributes = only_record(exported).attributes
+    assert attributes is not None
+    return attributes
 
 
 def test_structlog_record_is_exported_once(exported: InMemoryLogRecordExporter, logger: Logger) -> None:
-    pass  # TODO: implement
+    logger.info("hello", invoice_id="INV-1")
+    assert only_attributes(exported)["invoice_id"] == "INV-1"
 
 
 def test_stdlib_record_is_exported_once(exported: InMemoryLogRecordExporter) -> None:
-    pass  # TODO: implement
+    logging.getLogger("uvicorn.error").info("hello")
+    assert only_record(exported).body == "hello"
 
 
 def test_stdlib_record_goes_through_structlog(exported: InMemoryLogRecordExporter) -> None:
-    pass  # TODO: implement
+    structlog.contextvars.bind_contextvars(correlation_id="abc-123")
+    logging.getLogger("uvicorn.error").info("hello")
+    structlog.contextvars.clear_contextvars()
+    attributes = only_attributes(exported)
+    assert attributes["logger"] == "uvicorn.error"
+    assert attributes["correlation_id"] == "abc-123"
 
 
 def test_scope_is_the_logger_name(exported: InMemoryLogRecordExporter) -> None:
-    pass  # TODO: implement
+    logging.getLogger("uvicorn.error").info("hello")
+    assert only_scope(exported) == "uvicorn.error"
 
 
 def test_trace_id_is_set_on_the_record(exported: InMemoryLogRecordExporter, logger: Logger) -> None:
-    pass  # TODO: implement
+    with trace.get_tracer("test").start_as_current_span("work") as span:
+        logger.info("hello")
+    assert only_record(exported).trace_id == span.get_span_context().trace_id
 
 
 def test_service_name_is_not_an_attribute(exported: InMemoryLogRecordExporter, logger: Logger) -> None:
-    pass  # TODO: implement
+    with trace.get_tracer("test").start_as_current_span("work"):
+        logger.info("hello")
+    assert "service.name" not in only_attributes(exported)
 
 
 def test_exception_is_exported(exported: InMemoryLogRecordExporter, logger: Logger) -> None:
-    pass  # TODO: implement
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        logger.exception("failed")
+    assert "ValueError: boom" in str(only_attributes(exported)["exception.stacktrace"])
 
 
 @pytest.fixture
 def named_timezone(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    pass  # TODO: implement
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
 
 
 def test_timestamp_is_event_time(exported: InMemoryLogRecordExporter, logger: Logger, named_timezone: None) -> None:
-    pass  # TODO: implement
+    logger.info("hello")
+    record = only_record(exported)
+    assert record.timestamp is not None
+    assert record.observed_timestamp - record.timestamp < 1_000_000_000
 
 
 def test_reconfiguring_keeps_app_loggers_enabled(settings: Settings) -> None:
-    pass  # TODO: implement
+    get_logger("tests.reconfigured").info("creates the stdlib logger")
+    logging.getLogger("tests.unrelated")
+    structlog.reset_defaults()
+    configure_logging(settings=settings)
+    assert logging.getLogger("tests.reconfigured").disabled is False
+    assert logging.getLogger("tests.unrelated").disabled is True
 
 
 @pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (TimeoutError(), "TimeoutError"),
+        (KeyError("usd"), "KeyError: 'usd'"),
+        (ValueError("Kraken Ticker request failed"), "ValueError: Kraken Ticker request failed"),
+    ],
 )
 def test_exception_summary(exc: Exception, expected: str) -> None:
-    pass  # TODO: implement
+    assert get_exception_summary(exc) == expected
 
 
 def test_exception_details() -> None:
-    pass  # TODO: implement
+    assert get_exception_details(ValueError("no rate")) == "no rate"
+    with pytest.raises(ValueError) as exc_info:
+        try:
+            raise TimeoutError
+        except TimeoutError as e:
+            raise ValueError("no rate") from e
+    assert get_exception_details(exc_info.value) == "no rate (TimeoutError)"

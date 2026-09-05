@@ -7,40 +7,66 @@ from api import exceptions, templates
 
 
 class DummyInvoice:
-    pass  # TODO: implement
+    buyer_email = "test@test.com"
 
 
 class DummyRefund:
-    pass  # TODO: implement
+    id = "refund"
+    currency = "USD"
+    amount = Decimal("10.500000000000000000")
 
 
 def test_default_template_render(notification_template: str) -> None:
-    pass  # TODO: implement
+    template = templates.Template("notification")
+    assert template.name == "notification"
+    assert template.template_text == notification_template
+    assert template.render() == ""  # Silent error handling
+    assert template.render(invoice=DummyInvoice()) == "New order from test@test.com for  !"
 
 
 def test_unknown_template_render() -> None:
-    pass  # TODO: implement
+    with pytest.raises(exceptions.TemplateLoadError):
+        templates.Template("test")
 
 
 def test_text_template_render() -> None:
-    pass  # TODO: implement
+    template = templates.Template("test", "Hello {{var}}!")
+    assert template.name == "test"
+    assert template.template_text == "Hello {{var}}!"
+    assert template.render() == "Hello !"
+    assert template.render(var="world") == "Hello world!"
 
 
 def test_add_template() -> None:
-    pass  # TODO: implement
+    manager = templates.TemplateManager()
+    template = templates.Template("product")
+    manager.add_template(template)
+    assert manager.templates["product"] == template
 
 
 @pytest.mark.parametrize(("currency", "price", "expected"), [("USD", "10.5", "10.50"), ("BTC", "0.00000001", "0.00000001")])
 def test_format_decimal_legitimate_field(currency: str, price: str, expected: str) -> None:
-    pass  # TODO: implement
+    template = templates.Template("test", '{{ invoice | format_decimal("price") }}')
+    assert template.render(invoice=SimpleNamespace(currency=currency, price=Decimal(price))) == expected
 
 
 def test_format_decimal_attribute_isolation() -> None:
-    pass  # TODO: implement
+    template = templates.Template("test", '{{ namespace() | format_decimal("__class__") }}')
+    assert template.render() == ""
 
+    chained = (
+        '{% set a = namespace() | format_decimal("__class__") %}'
+        '{% set b = a | format_decimal("__init__") %}'
+        '{% set c = b | format_decimal("__globals__") %}'
+        "{{ c }}"
+    )
+    assert templates.Template("test", chained).render() == ""
 
 
 @pytest.mark.parametrize(
+    ("name", "expected"),
+    [("customer_refund", "refund you the amount of 10.50 USD."), ("merchant_refund_notify", "Refund refund for 10.50 USD")],
 )
 def test_refund_templates_format_amount(name: str, expected: str) -> None:
-    pass  # TODO: implement
+    rendered = templates.Template(name).render(invoice=DummyInvoice(), refund=DummyRefund(), refund_url="url")
+    assert expected in rendered

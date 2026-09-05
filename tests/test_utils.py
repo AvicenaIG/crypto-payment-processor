@@ -32,202 +32,632 @@ from api.types import PasswordHasherProtocol, StrEnum
 from tests.helper import create_notification, create_store, enabled_logs
 
 if TYPE_CHECKING:
+    from httpx import AsyncClient as TestClient
 
 # https://docs.hcaptcha.com/#integration-testing-test-keys
 # https://developers.cloudflare.com/turnstile/reference/testing
 VALID_CAPTCHA = {
+    CaptchaType.HCAPTCHA: {
+        "API": "https://hcaptcha.com/siteverify",
+        "CODE": "20000000-aaaa-bbbb-cccc-000000000002",
+        "SECRET": "0x0000000000000000000000000000000000000000",
+    },
+    CaptchaType.CF_TURNSTILE: {
+        "API": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        "CODE": "1x00000000000000000000AA",
+        "SECRET": "1x0000000000000000000000000000000AA",
+    },
 }
 
 
 @pytest.fixture
 async def password_hasher(app: FastAPI) -> PasswordHasherProtocol:
+    return await app.state.dishka_container.get(PasswordHasherProtocol)
 
 
 def test_verify_password(password_hasher: PasswordHasherProtocol) -> None:
-    pass  # TODO: implement
+    p_hash = password_hasher.get_password_hash("12345")
+    assert isinstance(p_hash, str)
+    assert password_hasher.verify_password("12345", p_hash)
 
 
 @dataclass
 class MockTemplateObj:
-    pass  # TODO: implement
+    template_name: str
+    create_id: str = "1"
+    mock_name: str = "MockTemplateObj"
+    user_id: str = "1"
+    id: str = "1"
 
+    @property
     def templates(self) -> dict[str, str]:
-        pass  # TODO: implement
+        return {self.template_name: self.create_id}
 
     def __str__(self) -> str:
-        pass  # TODO: implement
+        return self.mock_name
 
 
 @dataclass
 class MockStore:
-    pass  # TODO: implement
+    user_id: str = "1"
 
     def __str__(self) -> str:
-        pass  # TODO: implement
+        return "MockStore"
 
 
 @pytest.mark.anyio
 async def test_get_template(
+    notification_template: str, client: TestClient, token: str, user: dict[str, Any], app: FastAPI
 ) -> None:
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_template("notification")
+    assert template.name == "notification"
+    assert template.template_text == notification_template
+    assert template.render() == ""
+    with pytest.raises(exceptions.TemplateDoesNotExistError):
+        async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+            template_service = await container.get(TemplateService)
+            await template_service.get_template("templ")
+    resp = await client.post(
+        "/templates",
+        json={"name": "templ", "text": "Hello {{var1}}!"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    template_id = resp.json()["id"]
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template2 = await template_service.get_template("templ", user_id=user["id"])
+    assert template2.name == "templ"
+    assert template2.template_text == "Hello {{var1}}!"
+    assert template2.render() == "Hello !"
+    assert template2.render(var1="world") == "Hello world!"
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template3 = await template_service.get_template(
+            "notification", obj=MockTemplateObj(template_name="notification", create_id=template_id)
+        )
+    assert template3.name == "notification"
+    assert template3.template_text == template2.template_text
 
 
 @pytest.mark.anyio
 async def test_product_template(client: TestClient, token: str, user: dict[str, Any], app: FastAPI) -> None:
+    qty = 10
+    product_template = MockTemplateObj(template_name="product", mock_name="MockProduct")
+    store = MockStore(user_id=user["id"])
+    # default product template
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_product_template(store, product_template, qty)
+    assert template == f"Thanks for buying  x {qty}!\nIt'll ship shortly!\n"
+    # custom template
+    resp = await client.post(
+        "/templates",
+        json={"name": "product", "text": "store={{store}}|product={{product}}|quantity={{quantity}}"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    template_id = resp.json()["id"]
+    # Required for unique id
+    product_template.create_id = template_id
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_product_template(store, product_template, qty)
+    assert template == f"store={store}|product={product_template}|quantity={qty}"
 
 
 @pytest.mark.anyio
 async def test_store_template(client: TestClient, token: str, user: dict[str, Any], app: FastAPI) -> None:
+    shop = MockTemplateObj(template_name="shop", mock_name="MockShop", user_id=user["id"])
+    product = "my product"
+    # default store template
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_store_template(shop, [product])
+    assert template.startswith("Welcome to our shop")
+    # custom template
+    resp = await client.post(
+        "/templates",
+        json={"name": "shop", "text": "store={{store}}|products={{products}}"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    template_id = resp.json()["id"]
+    shop.create_id = template_id
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_store_template(shop, product)
+    assert template == f"store={shop}|products={product}"
 
 
 @pytest.mark.anyio
 async def test_notification_template(client: TestClient, token: str, user: dict[str, Any], app: FastAPI) -> None:
+    invoice = "my invoice"
+    notification = MockTemplateObj(template_name="notification", mock_name="MockNotification", user_id=user["id"])
+    # default notification template
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_notify_template(notification, invoice)
+    assert template.strip() == "New order from  for  !"
+    # custom template
+    resp = await client.post(
+        "/templates",
+        json={"name": "notification", "text": "store={{store}}|invoice={{invoice}}"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    template_id = resp.json()["id"]
+    notification.create_id = template_id
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        template_service = await container.get(TemplateService)
+        template = await template_service.get_notify_template(notification, invoice)
+    assert template == f"store={notification}|invoice={invoice}"
 
 
 # NOTE: this only works because those methods don't call any session-based objects
 @pytest.fixture
 async def management_service(app: FastAPI) -> ManagementService:
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        return await container.get(ManagementService)
 
 
 def test_parse_log_date(settings: Settings, management_service: ManagementService) -> None:
-    pass  # TODO: implement
+    with enabled_logs(settings):
+        assert management_service._parse_log_date("crypto-payment-processor20210821.log") == datetime(2021, 8, 21)
+        assert management_service._parse_log_date("crypto-payment-processor20250210.log") == datetime(2025, 2, 10)
+        assert management_service._parse_log_date("crypto-payment-processor.log") is None  # current log, no date
+        assert management_service._parse_log_date("other20210821.log") is None  # wrong prefix
+        assert management_service._parse_log_date("crypto-payment-processorinvalid.log") is None  # invalid date
+    assert management_service._parse_log_date("crypto-payment-processor20210821.log") is None
 
 
 @pytest.mark.anyio
 async def test_cleanup_old_logs(settings: Settings, management_service: ManagementService, tmp_path: pathlib.Path) -> None:
+    log_dir = str(tmp_path / "logs")
+    os.makedirs(log_dir)
+    current_log = os.path.join(log_dir, "crypto-payment-processor.log")
+    old_log = os.path.join(log_dir, "crypto-payment-processor20200101.log")
+    recent_log = os.path.join(log_dir, "crypto-payment-processor99991231.log")
+    for f in [current_log, old_log, recent_log]:
+        with open(f, "w") as fh:  # noqa: ASYNC230
+            fh.write("test\n")
+    with enabled_logs(settings, datadir=str(tmp_path)):
+        # Cleanup with 90-day retention should remove old log but keep recent one
+        await management_service.cleanup_old_logs(90)
+        assert not os.path.exists(old_log)
+        assert os.path.exists(recent_log)
+        # Current log file (crypto-payment-processor.log) should never be touched
+        assert os.path.exists(current_log)
 
 
 def test_versiontuple() -> None:
-    pass  # TODO: implement
+    assert utils.common.versiontuple("1.2.3") == (1, 2, 3)
+    assert utils.common.versiontuple("0.6.0.0") == (0, 6, 0, 0)
+    with pytest.raises(ValueError):
+        utils.common.versiontuple("0.6.0.0dev")  # not supported for now
 
 
 @pytest.mark.anyio
 async def test_custom_create_task(caplog: pytest.LogCaptureFixture) -> None:
+    err_msg = "Test exception"
 
+    async def task() -> None:
+        raise Exception(err_msg)
 
+    utils.tasks.create_task(task())
+    await asyncio.sleep(1)
+    assert err_msg in caplog.text
+    caplog.clear()
+    utils.tasks.create_task(task()).cancel()
+    await asyncio.sleep(1)
+    assert err_msg not in caplog.text
 
 
 @pytest.mark.anyio
 async def test_no_exchange_rates_available(mocker: pytest_mock.MockerFixture, wallet: dict[str, Any], app: FastAPI) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    error = BitcartBaseError("No exchange rates available")
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=error)
+    with pytest.raises(exceptions.RateUnavailableError, match="BTC_USD") as exc_info:
+        await wallet_data_service.get_rate(DisplayWallet(**wallet), "USD")
+    assert exc_info.value.__cause__ is error
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    ("rules", "cause"),
+    [
+        ("X_X = coingecko(X_X", SyntaxError),
+        ("BTCUSD = coingecko(BTC_USD)\nX_X = BTCUSD", Exception),
+        ("X_X = coingecko(X_X) ** 2", KeyError),
+        ("X_X = 1 / 0", ArithmeticError),
+    ],
 )
 async def test_broken_rate_rules(
+    caplog: pytest.LogCaptureFixture, wallet: dict[str, Any], app: FastAPI, rules: str, cause: type[Exception]
 ) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    store = models.Store(checkout_settings=StoreCheckoutSettings(rate_rules=rules))
+    with pytest.raises(exceptions.RateUnavailableError, match="BTC_USD") as exc_info:
+        await wallet_data_service.get_rate(DisplayWallet(**wallet), "USD", store=store)
+    assert isinstance(exc_info.value.__cause__, cause)
+    assert "Error fetching rate BTC_USD" in caplog.text
 
 
 @pytest.mark.anyio
 async def test_exchange_rates_unavailable_passes_through(
+    mocker: pytest_mock.MockerFixture, caplog: pytest.LogCaptureFixture, wallet: dict[str, Any], app: FastAPI
 ) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    mocker.patch(
+        "api.services.exchange_rate.ExchangeRateService.get_rate", side_effect=exceptions.ExchangeRatesUnavailableError()
+    )
+    with pytest.raises(exceptions.ExchangeRatesUnavailableError):
+        await wallet_data_service.get_rate(DisplayWallet(**wallet), "USD")
+    assert "Error fetching rate" not in caplog.text
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("value", ["NaN", "0", "-1", "Infinity"])
 async def test_invalid_exchange_rate(
+    mocker: pytest_mock.MockerFixture, wallet: dict[str, Any], app: FastAPI, value: str
 ) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", return_value=Decimal(value))
+    with pytest.raises(exceptions.RateUnavailableError) as exc_info:
+        await wallet_data_service.get_rate(DisplayWallet(**wallet), "USD")
+    assert (exc_info.value.left, exc_info.value.right) == ("BTC", "USD")
 
 
 @pytest.mark.anyio
 async def test_plugin_supplies_missing_rate(mocker: pytest_mock.MockerFixture, wallet: dict[str, Any], app: FastAPI) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", return_value=Decimal("NaN"))
+    plugin_registry = wallet_data_service.plugin_registry
+    apply_filters = plugin_registry.apply_filters
+    filtered_rates = []
 
+    async def get_rate_filter(name: str, value: Any, *args: Any, **kwargs: Any) -> Any:
+        if name != "get_rate":
+            return await apply_filters(name, value, *args, **kwargs)
+        filtered_rates.append(value)
+        return Decimal(5)
 
+    mocker.patch.object(plugin_registry, "apply_filters", side_effect=get_rate_filter)
+    assert await wallet_data_service.get_rate(DisplayWallet(**wallet), "USD") == Decimal(5)
+    assert len(filtered_rates) == 1
+    assert filtered_rates[0].is_nan()
 
 
 @pytest.mark.anyio
 async def test_low_price_rate_not_rounded(mocker: pytest_mock.MockerFixture, wallet: dict[str, Any], app: FastAPI) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    mocker.patch("api.services.exchange_rate.ExchangeRateService.get_rate", return_value=Decimal("0.004123"))
+    assert await wallet_data_service.get_rate(DisplayWallet(**wallet), "USD") == Decimal("0.004123")
 
 
 @pytest.mark.anyio
 async def test_broken_coin(
+    mocker: pytest_mock.MockerFixture, caplog: pytest.LogCaptureFixture, wallet: dict[str, Any], app: FastAPI
 ) -> None:
+    wallet_data_service = await app.state.dishka_container.get(WalletDataService)
+    mocker.patch("crypto-payment-processor.BTC.balance", side_effect=BitcartBaseError("Coin broken"))
+    success, divisibility, balance = await wallet_data_service.get_confirmed_wallet_balance(DisplayWallet(**wallet))
+    assert not success
+    assert divisibility == 8
+    assert balance == Decimal(0)
+    assert "Error getting wallet balance" in caplog.text
 
 
 def test_search_query_parsing() -> None:
-    pass  # TODO: implement
+    q1 = utils.common.SearchQuery("text")
+    assert q1.text == "text"
+    assert q1.filters == {}
+    q2 = utils.common.SearchQuery(
+        'column:value column:value2 text column2:value2 text2 column3:other:value column2:value3 "column3:other:value"'
+    )
+    assert q2.text == "text text2 column3:other:value"
+    assert q2.filters == {"column": ["value", "value2"], "column2": ["value2", "value3"], "column3": ["other:value"]}
 
 
 def test_search_query_metadata_parsing() -> None:
-    pass  # TODO: implement
+    q1 = utils.common.SearchQuery("metadata.external_id:abc123")
+    assert q1.metadata_filters == {"external_id": ["abc123"]}
+    assert q1.filters == {}
+    assert q1.text == ""
+    q2 = utils.common.SearchQuery("metadata.external_id:abc123 status:complete")
+    assert q2.metadata_filters == {"external_id": ["abc123"]}
+    assert q2.filters == {"status": ["complete"]}
+    assert q2.text == ""
+    q3 = utils.common.SearchQuery("metadata.external_id:abc123 metadata.external_id:abc124 status:complete status:pending")
+    assert q3.metadata_filters == {"external_id": ["abc123", "abc124"]}
+    assert q3.filters == {"status": ["complete", "pending"]}
+    assert q3.text == ""
 
 
 def check_date(date: datetime | None, **kwargs: int) -> None:
-    pass  # TODO: implement
+    now = utils.time.now()
+    assert now - cast(datetime, date) >= timedelta(**kwargs)
 
 
 def test_search_query_parse_datetime() -> None:
-    pass  # TODO: implement
+    assert utils.common.SearchQuery("start_date:-1").parse_datetime("start_date") is None
+    assert utils.common.SearchQuery("start_date:-testd").parse_datetime("start_date") is None
+    check_date(utils.common.SearchQuery("start_date:-1d").parse_datetime("start_date"), days=1)
+    check_date(utils.common.SearchQuery("end_date:-1d").parse_datetime("end_date"), days=1)
+    check_date(utils.common.SearchQuery("start_date:-1h").parse_datetime("start_date"), hours=1)
+    check_date(utils.common.SearchQuery("start_date:-1w").parse_datetime("start_date"), weeks=1)
+    check_date(utils.common.SearchQuery("start_date:-1m").parse_datetime("start_date"), days=30)
+    check_date(utils.common.SearchQuery("start_date:-1y").parse_datetime("start_date"), days=30 * 12)
+    check_date(utils.common.SearchQuery("start_date:-150d").parse_datetime("start_date"), days=150)
+    assert utils.common.SearchQuery("start_date:2024-01-15").parse_datetime("start_date") == datetime(2024, 1, 15)
+    assert utils.common.SearchQuery("start_date:2024-01-15T12:30:00").parse_datetime("start_date") == datetime(
+        2024, 1, 15, 12, 30, 0
+    )
+    assert utils.common.SearchQuery("start_date:2024-01-15T12:30:00+00:00").parse_datetime("start_date") == datetime(
+        2024, 1, 15, 12, 30, 0, tzinfo=UTC
+    )
+    assert utils.common.SearchQuery("start_date:2024-01-15T12:30:00Z").parse_datetime("start_date") == datetime(
+        2024, 1, 15, 12, 30, 0, tzinfo=UTC
+    )
+    assert utils.common.SearchQuery("start_date:2026-02-02T21:00:00.000Z").parse_datetime("start_date") == datetime(
+        2026, 2, 2, 21, 0, 0, tzinfo=UTC
+    )
+    assert utils.common.SearchQuery("start_date:notadate").parse_datetime("start_date") is None
+    assert utils.common.SearchQuery("start_date:2024-13-01").parse_datetime("start_date") is None
 
 
 async def check_modify_notify(
+    notification_manager: NotificationManager,
+    client: TestClient,
+    store: models.Store,
+    notification_id: str,
+    token: str,
+    base_data: dict[str, Any],
+    key: str,
+    value: Any,
+    convert: Callable[[Any], Any],
 ) -> None:
+    assert (
+        await client.patch(
+            f"/notifications/{notification_id}",
+            json={"data": {**base_data, key: value}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await notification_manager.notify(store, "Text")).ok is True
+    # run only if conversion works
+    try:
+        converted = convert(value)
+        assert (
+            await client.patch(
+                f"/notifications/{notification_id}",
+                json={"data": {**base_data, key: converted}},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).status_code == 200
+        await notification_manager.notify(store, "Text")
+    except Exception:
+        pass
 
 
 @pytest.mark.anyio
 async def test_send_notification(client: TestClient, token: str, mocker: pytest_mock.MockerFixture, app: FastAPI) -> None:
+    notification_manager = await app.state.dishka_container.get(NotificationManager)
+    mocker.patch("apprise.plugins.matrix.NotifyMatrix.send", return_value=True)
+    notification = await create_notification(client, token, data={"user_id": 5})
+    notification_id = notification["id"]
+    data = await create_store(client, token, custom_store_attrs={"notifications": [notification_id]})
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        store_service = await container.get(StoreService)
+        store = await store_service.get_or_none(data["id"])
+    resp = await client.patch(
+        f"/notifications/{notification_id}",
+        json={"provider": "Telegram"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == notification["data"]
+    resp2 = await client.patch(
+        f"/notifications/{notification_id}",
+        json={"provider": "Matrix"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["provider"] == "Matrix"
+    assert resp2.json()["data"] == {}
+    result = await notification_manager.notify(store, "Text")
+    assert result.has_providers
+    assert not result.ok
+    base_data = {"host": "matrix.org"}
+    assert (
+        await client.patch(
+            f"/notifications/{notification_id}",
+            json={"data": base_data},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).status_code == 200
+    assert (await notification_manager.notify(store, "Text")).ok is True
+    # Test that some primitive types are automatically converted
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "verify", "test", bool)
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "verify", "true", bool)
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "verify", True, bool)
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "port", "5", int)
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "port", "test", int)
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "rto", "5.5", int)
+    await check_modify_notify(notification_manager, client, store, notification_id, token, base_data, "rto", "test", int)
 
 
 @pytest.mark.anyio
 async def test_run_universal() -> None:
     def func(arg: int) -> int:
-        pass  # TODO: implement
+        return arg
 
+    async def async_func(arg: int) -> int:
+        return arg
 
+    assert await utils.common.run_universal(func, 5) == await utils.common.run_universal(async_func, 5) == 5
 
 
 def test_get_redirect_url() -> None:
-    pass  # TODO: implement
+    assert utils.routing.get_redirect_url("https://example.com", code="test") == "https://example.com?code=test"
+    assert utils.routing.get_redirect_url("https://example.com?code=1", code="test") == "https://example.com?code=1&code=test"
 
 
 def test_gen_recovery_code() -> None:
-    pass  # TODO: implement
+    code = utils.authorization.generate_tfa_recovery_code()
+    assert len(code) == 11
+    assert code[5] == "-"
+    assert all(x in TFA_RECOVERY_ALPHABET for x in code[:5])
+    assert all(x in TFA_RECOVERY_ALPHABET for x in code[6:])
 
 
 def test_str_enum() -> None:
-    pass  # TODO: implement
     class TestEnum(StrEnum):
-        pass  # TODO: implement
+        TEST = "test"
+        TEST2 = "test2"
 
+    assert TestEnum.TEST == "test"
+    assert TestEnum.TEST2 == "test2"
 
+    assert list(TestEnum) == ["test", "test2"]
+    assert "test" in TestEnum
+    assert "test2" in TestEnum
+    assert "test3" not in TestEnum
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("impl", [CaptchaType.HCAPTCHA, CaptchaType.CF_TURNSTILE])
 async def test_verify_captcha(impl: CaptchaType, app: FastAPI) -> None:
+    details = VALID_CAPTCHA[cast(str, impl)]
+    # Test with valid code & secret
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        auth_service = await container.get(AuthService)
+        assert await auth_service.verify_captcha(details["API"], code=details["CODE"], secret=details["SECRET"])
 
+    # Test with invalid code/secret
+    if str(impl) == CaptchaType.CF_TURNSTILE:
+        async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+            auth_service = await container.get(AuthService)
+            assert await auth_service.verify_captcha(
+                details["API"], code="non-valid-code", secret=details["SECRET"]
+            )  # secret takes precedence
+    else:
+        async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+            auth_service = await container.get(AuthService)
+            assert not await auth_service.verify_captcha(details["API"], code="non-valid-code", secret=details["SECRET"])
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        auth_service = await container.get(AuthService)
+        assert not await auth_service.verify_captcha(details["API"], code=details["CODE"], secret="non-valid-secret")
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("impl", [CaptchaType.HCAPTCHA, CaptchaType.CF_TURNSTILE])
 async def test_captcha_flow(mocker: pytest_mock.MockerFixture, impl: CaptchaType, app: FastAPI) -> None:
+    fake_run_hook = mocker.patch("api.services.plugin_registry.PluginRegistry.run_hook")
 
+    fake_policy = mocker.Mock()
+    fake_policy.captcha_secretkey = VALID_CAPTCHA[cast(str, impl)]["SECRET"]
+    fake_policy.captcha_type = impl
+    mocker.patch("api.services.settings.SettingService.get_setting", return_value=fake_policy)
+    async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+        auth_service = await container.get(AuthService)
+        await auth_service.captcha_flow(VALID_CAPTCHA[cast(str, impl)]["CODE"])
+    fake_run_hook.assert_called_once_with("captcha_passed")
 
+    fake_run_hook.reset_mock()
+    fake_policy.captcha_secretkey = "non-valid-secret"
+    with pytest.raises(HTTPException):
+        async with app.state.dishka_container(scope=Scope.REQUEST) as container:
+            auth_service = await container.get(AuthService)
+            await auth_service.captcha_flow("invalid-code")
+    fake_run_hook.assert_called_once_with("captcha_failed")
 
 
 @pytest.mark.parametrize(
+    ("rate", "expected"),
+    [
+        ("50000.000000000000000000", "50000"),
+        ("0.004000000000000000", "0.004"),
+        ("4123456789012.345678901234567891", "4123456789012.345678901234567891"),
+    ],
 )
 def test_payment_method_raw_rate(rate: str, expected: str) -> None:
-    pass  # TODO: implement
+    method = models.PaymentMethod(
+        rate=Decimal(rate),
+        amount=Decimal(1),
+        network_fee=Decimal(0),
+        effective_price=Decimal(1),
+        symbol="btc",
+        divisibility=8,
+        payment_url="bitcoin:",
+        lightning=False,
+    )
+    assert method.to_payment_dict("USD")["rate"] == expected
 
 
 @pytest.mark.parametrize(
+    ("effective_prices", "payment_id", "expected"),
+    [
+        ({"a": Decimal(2500), "b": Decimal(4000)}, "a", "2500.00"),
+        ({"a": Decimal(2500), "b": Decimal(4000)}, "b", "4000.00"),
+        ({"a": Decimal(2500), "b": Decimal(4000)}, None, "5000.00"),
+        ({"a": Decimal(4500), "b": Decimal("4500.000000000000000000")}, None, "4500.00"),
+        ({"a": Decimal(5000), "b": Decimal(5000)}, None, "5000.00"),
+        ({}, None, "5000.00"),
+    ],
 )
 def test_find_effective_price(effective_prices: dict[str, Decimal], payment_id: str | None, expected: str) -> None:
-    pass  # TODO: implement
+    payments = [models.PaymentMethod(id=key, effective_price=value) for key, value in effective_prices.items()]
+    assert InvoiceService.find_effective_price("USD", Decimal(5000), payments, payment_id) == expected
 
 
 @pytest.mark.parametrize(
+    ("amount", "rate", "sent_amount", "sent_price"),
+    [
+        (Decimal("0.34"), Decimal(3), Decimal(0), "0.00"),
+        (Decimal("0.34"), Decimal(3), Decimal("0.33"), "0.99"),
+        (Decimal("0.34"), Decimal(3), Decimal("0.34"), "1.02"),
+        (Decimal("0.34"), Decimal(3), Decimal("0.35"), "1.05"),
+        (Decimal("0.00033334"), Decimal(30000), Decimal("0.00033333"), "9.99"),
+        (Decimal("0.00033334"), Decimal(30000), Decimal("0.00033334"), "10.00"),
+        (Decimal("0.33"), (1 / Decimal("0.33")).quantize(Decimal(10) ** -18), Decimal("0.33"), "1.00"),
+    ],
 )
 def test_find_sent_price(amount: Decimal, rate: Decimal, sent_amount: Decimal, sent_price: str) -> None:
-    pass  # TODO: implement
+    method = models.PaymentMethod(id="a", amount=amount, rate=rate)
+    assert InvoiceService.find_sent_price("USD", sent_amount, [method], "a") == sent_price
 
 
 @pytest.mark.parametrize(("due", "due_price"), [(Decimal("10.004"), "10.00"), (Decimal("10.005"), "10.01")])
 def test_payment_method_due_price_rounds_half_up(due: Decimal, due_price: str) -> None:
-    pass  # TODO: implement
+    method = models.PaymentMethod(
+        rate=Decimal(1),
+        amount=Decimal(11),
+        network_fee=Decimal(0),
+        effective_price=Decimal(11),
+        symbol="btc",
+        divisibility=8,
+        payment_url="bitcoin:",
+        lightning=False,
+    )
+    assert method.to_payment_dict("USD", due=due)["due_price"] == due_price
 
 
 @pytest.mark.parametrize(
+    ("status", "payment_id", "sent_amount", "due"),
+    [
+        ("pending", None, Decimal(0), Decimal("0.34")),
+        ("pending", "a", Decimal("0.33"), Decimal("0.01")),
+        ("pending", "b", Decimal("0.33"), Decimal("0.34")),
+        ("pending", "a", Decimal("0.35"), Decimal(0)),
+        ("expired", "a", Decimal("0.1"), Decimal("0.24")),
+        ("complete", "a", Decimal("0.3"), Decimal(0)),
+        ("refunded", "a", Decimal("0.34"), Decimal(0)),
+    ],
 )
 def test_find_due(status: str, payment_id: str | None, sent_amount: Decimal, due: Decimal) -> None:
-    pass  # TODO: implement
+    method = models.PaymentMethod(id="a", amount=Decimal("0.34"))
+    assert InvoiceService.find_due(method, status, payment_id, sent_amount) == due
