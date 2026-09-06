@@ -16,11 +16,16 @@ logger = get_logger(__name__)
 
 
 def format_decimal(obj: Any, key: str, **kwargs: Any) -> Any:
-    pass  # TODO: implement
+    value = sandbox.getattr(obj, key)
+    if isinstance(value, Undefined):
+        return ""
+    if not hasattr(obj, "currency"):
+        return value
+    return currency_table.format_decimal(obj.currency, value)
 
 
 def tg_escape(text: Any) -> str:
-    pass  # TODO: implement
+    return TG_MD_V1_RE.sub(r"\\\g<0>", str(text))
 
 
 sandbox = SandboxedEnvironment(trim_blocks=True)
@@ -32,15 +37,29 @@ sandbox.globals["delete_metadata"] = delete_metadata
 
 
 class Template:
-    pass  # TODO: implement
     def __init__(self, name: str, text: str | None = None, applicable_to: str = "", prefix: str = "api/templates") -> None:
-        pass  # TODO: implement
+        self.prefix = prefix
+        self.name = name
+        self.applicable_to = applicable_to
+        if text:
+            self.template_text = text
+        else:
+            self.load_from_file(name)
+        self.template = sandbox.from_string(self.template_text)
 
     def load_from_file(self, name: str) -> None:
-        pass  # TODO: implement
+        try:
+            with open(f"{self.prefix}/{name}.j2") as f:
+                self.template_text = f.read().strip()
+        except OSError as e:
+            raise TemplateLoadError(f"Failed to load template {name}: {e.strerror}") from e
 
     def render(self, *args: Any, **kwargs: Any) -> str:
-        pass  # TODO: implement
+        try:
+            return self.template.render(*args, **kwargs)
+        except TemplateError as e:
+            logger.error(f"Failed to render template {self.name}: {get_exception_message(e)}")
+            return ""
 
 
 ProductTemplate = Template("product", applicable_to="product")
@@ -56,12 +75,15 @@ ALL_TEMPLATES = {template.name: template for template in globals().values() if i
 
 
 class TemplateManager:
-    pass  # TODO: implement
     def __init__(self) -> None:
-        pass  # TODO: implement
+        self.init_defaults()
 
     def add_template(self, template: Template) -> None:
-        pass  # TODO: implement
+        self.templates[template.name] = template
+        self.templates_strings[template.applicable_to].append(template.name)
 
     def init_defaults(self) -> None:
-        pass  # TODO: implement
+        self.templates = ALL_TEMPLATES
+        self.templates_strings = defaultdict(list)
+        for template in self.templates.values():
+            self.templates_strings[template.applicable_to].append(template.name)

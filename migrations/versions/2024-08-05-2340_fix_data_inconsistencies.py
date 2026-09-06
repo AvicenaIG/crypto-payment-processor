@@ -18,8 +18,17 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    pass  # TODO: implement
+    op.execute("UPDATE products SET templates='{}' where templates IS NULL")
+    op.execute("UPDATE products SET image='' where image IS NULL")
+    op.execute("UPDATE invoices SET promocode='' where promocode IS NULL")
+    op.execute("UPDATE invoices SET shipping_address='' where shipping_address IS NULL")
+    op.execute("UPDATE invoices SET notes='' where notes IS NULL")
+    op.execute("UPDATE invoices SET redirect_url='' where redirect_url IS NULL")
+    op.execute("UPDATE invoices SET notification_url='' where notification_url IS NULL")
+    op.execute("UPDATE invoices SET buyer_email='' where buyer_email IS NULL")
+    op.execute("UPDATE wallets SET hint='' where hint IS NULL")
+    op.execute("UPDATE notifications SET provider='Telegram' where provider='telegram'")
 
 
 def downgrade() -> None:
-    pass  # TODO: implement
+    pass

@@ -22,6 +22,7 @@ from api.settings import Settings
 from api.utils.authorization import register_scope
 
 if TYPE_CHECKING:
+    from api.services.plugin_registry import PluginRegistry
 
 SKIP_PAYMENT_METHOD = object()  # return this in your plugin if you want to skip current method creation
 
@@ -29,129 +30,215 @@ logger = get_logger(__name__)
 
 
 def get_plugin_logger(module_name: str) -> Logger:
-    pass  # TODO: implement
+    parts = module_name.split(".")
+    if len(parts) >= 3 and parts[0] == "modules":
+        orgname = parts[1]
+        clean_name = ".".join(parts[2:]) if orgname == "crypto-payment-processor" else ".".join(parts[1:])
+        return get_logger(clean_name)
+    return get_logger(module_name)
 
 
 def jsonable_encoder(obj: Any) -> Any:
-    pass  # TODO: implement
+    if isinstance(obj, models.Model):
+        obj = vars(obj)
+        obj = {key: value for key, value in obj.items() if not key.startswith("_sa")}
+    return TypeAdapter(Any).dump_python(obj, mode="json")
 
 
 def update_metadata[T: models.RecordModel](obj: T, key: str, value: Any) -> T:
-    pass  # TODO: implement
+    obj.meta[key] = jsonable_encoder(value)
+    return obj
 
 
 def get_metadata[T: models.RecordModel](obj: T, key: str, default: Any = None) -> Any:
-    pass  # TODO: implement
+    return obj.meta.get(key, default)
 
 
 def delete_metadata[T: models.RecordModel](obj: T, key: str) -> T:
-    pass  # TODO: implement
+    if key in obj.meta:
+        del obj.meta[key]
+    return obj
 
 
 # Exposed public API
 def is_crypto-payment-processor_compatible(version_constraint: str, crypto-payment-processor_version: str) -> bool:
-    pass  # TODO: implement
+    return crypto-payment-processor_version in Requirement(f"crypto-payment-processor{version_constraint}").specifier
 
 
 class PluginContext:
-    pass  # TODO: implement
     def __init__(self, plugin_registry: "PluginRegistry", container: DIContainer):
-        pass  # TODO: implement
+        self.plugin_registry = plugin_registry
+        self.container = container  # use it to query any services
 
     def register_settings(self, plugin_name: str, settings_class: type[Schema]) -> None:
-        pass  # TODO: implement
+        self.plugin_registry.register_settings(plugin_name, settings_class)
 
+    async def get_plugin_settings(self, plugin_name: str) -> Schema | None:
+        return await self.plugin_registry.get_plugin_settings(plugin_name)
 
+    async def run_hook(self, name: str, *args: Any, **kwargs: Any) -> None:
+        return await self.plugin_registry.run_hook(name, *args, **kwargs)
 
+    async def apply_filters(self, name: str, value: Any, *args: Any, **kwargs: Any) -> Any:
+        return await self.plugin_registry.apply_filters(name, value, *args, **kwargs)
 
     def register_hook(self, name: str, hook: Callable[..., Any]) -> None:
-        pass  # TODO: implement
+        self.plugin_registry.register_hook(name, hook)
 
+    register_filter = register_hook
 
     def register_event(self, name: str, params: list[str]) -> None:
-        pass  # TODO: implement
+        self.plugin_registry.register_event(name, params)
 
     def register_event_handler(self, name: str, handler: Callable[..., Any]) -> None:
-        pass  # TODO: implement
+        self.plugin_registry.register_event_handler(name, handler)
 
+    async def publish_event(self, name: str, data: Schema, for_worker: bool = True) -> None:
+        await self.plugin_registry.publish_event(name, data, for_worker)
 
     def json_encode(self, obj: Any) -> Any:
-        pass  # TODO: implement
+        return self.plugin_registry.json_encode(obj)
 
+    async def get_plugin_key_by_lookup(self, lookup_name: str, lookup_org: str) -> str | None:
+        return await self.plugin_registry.get_plugin_key_by_lookup(lookup_name, lookup_org)
 
     def add_template(self, name: str, text: str | None = None, applicable_to: str = "", *, path: str) -> None:
-        pass  # TODO: implement
+        self.plugin_registry.add_template(name, text, applicable_to, path=path)
 
     def get_plugin_data_dir(self, plugin_name: str) -> str:
-        pass  # TODO: implement
+        return self.plugin_registry.get_plugin_data_dir(plugin_name)
 
 
 class BasePlugin(metaclass=ABCMeta):
-    pass  # TODO: implement
+    name: str
+    lookup_name: str | None = None
+    lookup_org: str | None = None
 
+    PROVIDES: Callable[[], list[Provider]] | None = None
 
+    path: str  # set by crypto-payment-processor
 
+    context: PluginContext
 
     def __init__(self, path: str) -> None:
-        pass  # TODO: implement
+        self.path = path
+        self.license_key: str | None = None
 
     def _set_context(self, context: PluginContext) -> None:
-        pass  # TODO: implement
+        self.context = context
 
+    @property
     def container(self) -> DIContainer:
-        pass  # TODO: implement
+        return self.context.container
 
     def __repr__(self) -> str:
-        pass  # TODO: implement
+        return f"<{self.__class__.__name__} {self.name}>"
 
     def set_license_key(self, license_key: str) -> None:
-        pass  # TODO: implement
+        self.license_key = license_key
 
     def data_dir(self) -> str:
-        pass  # TODO: implement
+        """Get plugin's data directory"""
+        return self.context.get_plugin_data_dir(self.name)
 
+    @abstractmethod
     def setup_app(self, app: FastAPI) -> None:
-        pass  # TODO: implement
+        pass
 
+    @abstractmethod
+    async def startup(self) -> None:
+        pass
 
+    @abstractmethod
+    async def shutdown(self) -> None:
+        pass
 
+    @abstractmethod
+    async def worker_setup(self) -> None:
+        pass
 
     def register_template(self, name: str, text: str | None = None, applicable_to: str = "") -> None:
-        pass  # TODO: implement
+        self.context.add_template(name, text, applicable_to, path=self.path)
 
     def register_settings(self, settings_class: type[Schema]) -> None:
-        pass  # TODO: implement
+        self.context.register_settings(self.name, settings_class)
 
+    async def get_plugin_settings(self) -> Schema | None:
+        return await self.context.get_plugin_settings(self.name)
 
+    async def license_changed(self, license_key: str | None, license_info: dict[str, Any] | None) -> None:
+        self.license_key = license_key
 
 
 class CoinServer:
-    pass  # TODO: implement
     def __init__(self, currency: str, xpub: str | None, **additional_data: Any) -> None:
-        pass  # TODO: implement
+        self.currency = currency
+        self.xpub = xpub
+        self.additional_data = additional_data
 
+    async def getinfo(self) -> dict[str, Any]:
+        return {"currency": self.currency, "synchronized": True}
 
+    async def get_tokens(self) -> dict[str, Any]:
+        return {}
 
+    async def getabi(self) -> list[dict[str, Any]]:
+        return []
 
+    async def validatecontract(self, contract: str) -> bool:
+        return False
 
+    async def normalizeaddress(self, address: str) -> str:
+        return address
 
+    async def setrequestaddress(self, *args: Any, **kwargs: Any) -> bool:
+        return False
 
+    async def validateaddress(self, address: str) -> bool:
+        return True
 
+    async def modifypaymenturl(self, url: str, amount: Decimal, divisibility: int | None = None) -> str:
+        return url
 
 
 class BaseCoin(metaclass=ABCMeta):
-    pass  # TODO: implement
+    coin_name: str
+    friendly_name: str
+    is_eth_based = False
+    additional_xpub_fields: list[str] = []
+    rate_rules: str
 
     def __init__(self, xpub: str | None = None, **additional_data: Any) -> None:
-        pass  # TODO: implement
+        self.xpub = xpub
+        server_cls = getattr(self, "server_cls", CoinServer)
+        self.server = server_cls(self.coin_name.capitalize(), xpub, **additional_data)
 
+    @abstractmethod
+    async def validate_key(self, key: str, *args: Any, **kwargs: Any) -> bool:
+        pass
 
+    @abstractmethod
+    async def balance(self) -> dict[str, Decimal]:
+        pass
 
+    @property
+    async def node_id(self) -> str | None:
+        return None
 
+    async def list_channels(self) -> list[dict[str, Any]]:
+        return []
 
+    async def history(self) -> dict[str, Any]:
+        return {"transactions": []}
 
+    async def open_channel(self, *args: Any, **kwargs: Any) -> bool:
+        return False
 
+    async def close_channel(self, *args: Any, **kwargs: Any) -> bool:
+        return False
 
+    async def lnpay(self, *args: Any, **kwargs: Any) -> bool:
+        return False
 
 
 PluginClasses = NewType("PluginClasses", dict[str, type[BasePlugin]])
@@ -160,20 +247,61 @@ PluginObjects = NewType("PluginObjects", dict[str, BasePlugin])
 
 # Had to be put here in order to init DI container early
 def load_plugins(settings: Settings) -> tuple[PluginClasses, list[Provider]]:
-    pass  # TODO: implement
+    plugins_list = glob.glob("modules/**/**/plugin.py")
+    _plugins: PluginClasses = cast(PluginClasses, {})
+    providers: list[Provider] = []
+    if settings.is_testing():
+        return _plugins, providers
+    for plugin in plugins_list:
+        try:
+            module = load_module(plugin)
+            plugin_cls = module.Plugin
+            plugin_cls.path = os.path.dirname(plugin)
+            _plugins[plugin_cls.name] = plugin_cls
+            plugin_provider = Provider()
+            plugin_provider.from_context(provides=plugin_cls, scope=DIScope.APP)
+            providers.append(plugin_provider)
+            models_path = plugin.replace("plugin.py", "models.py")
+            if os.path.exists(models_path):
+                load_module(models_path)
+            ioc_path = plugin.replace("plugin.py", "ioc.py")
+            if os.path.exists(ioc_path) or os.path.exists(ioc_path.replace(".py", "")):  # file or package
+                ioc_module = load_module(ioc_path)
+                providers.extend(ioc_module.get_providers())
+        except Exception as e:
+            logger.error(f"Failed to load plugin {plugin}: {get_exception_message(e)}")
+    return _plugins, providers
 
 
 def load_module(path: str) -> Any:
-    pass  # TODO: implement
+    return importlib.import_module(path.replace("/", ".").replace(".py", ""))
 
 
 def init_plugins(plugin_classes: PluginClasses) -> PluginObjects:
-    pass  # TODO: implement
+    plugins: PluginObjects = cast(PluginObjects, {})
+    for plugin_name, plugin_cls in plugin_classes.items():
+        try:
+            plugin_obj = plugin_cls(plugin_cls.path)
+            plugins[plugin_obj.name] = plugin_obj
+        except Exception as e:
+            logger.error(f"Failed to load plugin {plugin_name}: {get_exception_message(e)}")
+    return plugins
 
 
 def build_plugin_di_context(plugin_objects: PluginObjects) -> dict[type[BasePlugin], BasePlugin]:
-    pass  # TODO: implement
+    return {type(plugin_obj): plugin_obj for plugin_obj in plugin_objects.values()}
 
 
 __all__ = [
+    "SKIP_PAYMENT_METHOD",
+    "FromDI",
+    "DIContainer",
+    "DIScope",
+    "DIRoute",
+    "PluginContext",
+    "BasePlugin",
+    "CoinServer",
+    "BaseCoin",
+    "register_scope",
+    "is_crypto-payment-processor_compatible",
 ]

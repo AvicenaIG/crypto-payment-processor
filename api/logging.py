@@ -30,100 +30,266 @@ app_loggers: set[str] = set()
 
 
 class MsgpackHandler(logging.handlers.SocketHandler):
-    pass  # TODO: implement
     def __init__(self, host: str, port: int) -> None:
-        pass  # TODO: implement
+        logging.handlers.SocketHandler.__init__(self, host, port)
 
     def msgpack_encoder(self, obj: Any) -> Any:
-        pass  # TODO: implement
+        if isinstance(obj, Schema):
+            return obj.model_dump()
+        if isinstance(obj, datetime):
+            return {"__datetime__": True, "data": obj.strftime("%Y%m%dT%H:%M:%S.%f")}
+        if isinstance(obj, Decimal):
+            return {"__decimal__": True, "data": str(obj)}
+        return str(obj)
 
     def makePickle(self, record: logging.LogRecord) -> bytes:
-        pass  # TODO: implement
+        if "_logger" in record.__dict__:  # added by structlog
+            del record.__dict__["_logger"]
+        return msgpack.packb(record.__dict__, default=self.msgpack_encoder)
 
 
 class StructlogOTELProcessor(StructlogProcessor):
-    pass  # TODO: implement
     def __call__(self, logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-        pass  # TODO: implement
+        otel_logger = self._logger_provider.get_logger(event_dict["logger"])
+        if not isinstance(otel_logger, NoOpLogger):
+            otel_logger.emit(self._translate(event_dict, method_name))
+        return event_dict
 
     def _translate(self, event_dict: dict[str, Any], method_name: str | None = None) -> LogRecord:
-        pass  # TODO: implement
+        record = super()._translate(event_dict, method_name)
+        record.timestamp = int(datetime.strptime(event_dict["timestamp"], TIME_FORMAT).timestamp() * 1e9)
+        return record
 
 
 class FormattingNullHandler(logging.Handler):
-    pass  # TODO: implement
     def emit(self, record: logging.LogRecord) -> None:
-        pass  # TODO: implement
+        self.format(record)
 
 
 class Logging[RendererType]:
-    pass  # TODO: implement
+    """Hubben logging configurator of `structlog` and `logging`.
 
+    Customized implementation inspired by the following documentation:
+    https://www.structlog.org/en/stable/standard-library.html#rendering-using-structlog-based-formatters-within-logging
 
+    """
 
+    timestamper = structlog.processors.TimeStamper(fmt=TIME_FORMAT, utc=False)
 
+    @classmethod
     def get_level(cls, settings: Settings) -> str:
-        pass  # TODO: implement
+        return settings.LOG_LEVEL
 
+    @classmethod
     def is_debug(cls, settings: Settings) -> bool:
-        pass  # TODO: implement
+        return settings.DEBUG
 
+    @classmethod
     def debug_loggers(cls, settings: Settings) -> list[str]:
-        pass  # TODO: implement
+        if cls.is_debug(settings):
+            return ["sqlalchemy.engine"]
+        return []
 
+    @classmethod
     def add_trace_context(cls, logger: Logger, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-        pass  # TODO: implement
+        span = trace.get_current_span()
+        if not span.is_recording():
+            return event_dict
+        ctx = span.get_span_context()
+        if not ctx.is_valid:
+            return event_dict
+        event_dict["trace_id"] = format(ctx.trace_id, "032x")
+        event_dict["span_id"] = format(ctx.span_id, "016x")
+        return event_dict
 
+    @classmethod
     def remove_callsite_params(
-        pass  # TODO: implement
+        cls,
+        logger: Logger,
+        method_name: str,
+        event_dict: dict[str, Any],
+    ) -> dict[str, Any]:
+        event_dict.pop("pathname", None)
+        event_dict.pop("func_name", None)
+        event_dict.pop("lineno", None)
+        return event_dict
 
+    @classmethod
     def get_common_processors(cls, *, settings: Settings) -> list[Any]:
-        pass  # TODO: implement
+        return [
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.ExtraAdder(),
+            cls.add_trace_context,
+            cls.timestamper,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.CallsiteParameterAdder(
+                {
+                    structlog.processors.CallsiteParameter.PATHNAME,
+                    structlog.processors.CallsiteParameter.FUNC_NAME,
+                    structlog.processors.CallsiteParameter.LINENO,
+                }
+            ),
+            structlog.processors.format_exc_info,
+            cls.remove_callsite_params,
+        ]
 
+    @classmethod
     def get_structlog_processors(cls, *, settings: Settings) -> list[Any]:
-        pass  # TODO: implement
+        return cls.get_common_processors(settings=settings) + [
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ]
 
+    @classmethod
     def get_renderer(cls) -> RendererType:
-        pass  # TODO: implement
+        raise NotImplementedError()
 
+    @classmethod
     def get_file_renderer(cls) -> RendererType:
-        pass  # TODO: implement
+        raise NotImplementedError()
 
+    @classmethod
     def get_third_party_loggers(cls, settings: Settings) -> list[str]:
-        pass  # TODO: implement
+        loggers_list = ["asyncio"] + cls.debug_loggers(settings)
+        loggers_list.append("uvicorn" if not settings.is_production() else "uvicorn.error")
+        return loggers_list
 
+    @classmethod
     def get_custom_level(cls, level: str, module: str) -> str | int:
-        pass  # TODO: implement
+        match module:
+            case "asyncio":
+                return logging.INFO
+            case "uvicorn" | "uvicorn.error":
+                return logging.INFO
+            case _:
+                return level
 
+    @staticmethod
     def configure_third_party() -> None:
-        pass  # TODO: implement
+        logging.getLogger("sqlalchemy.engine.Engine").handlers = [logging.NullHandler()]
+        logging.getLogger("python_multipart").setLevel(logging.CRITICAL + 1)
+        logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL + 1)
 
+    @classmethod
     def maybe_add_otel_handler(
-        pass  # TODO: implement
+        cls, *, target_logger: logging.Logger, otel_formatter: logging.Formatter, settings: Settings, level: str
+    ) -> None:
+        if not settings.OTEL_ENABLED:
+            return
+        otel_handler = FormattingNullHandler()
+        otel_handler.setLevel(level)
+        otel_handler.setFormatter(otel_formatter)
+        target_logger.addHandler(otel_handler)
 
+    @classmethod
     def configure_stdlib(cls, *, settings: Settings, logserver: bool = False) -> None:
-        pass  # TODO: implement
+        cls.configure_third_party()
+        level = cls.get_level(settings)
+        console_formatter = structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=cls.get_common_processors(settings=settings),
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                cast(structlog.typing.Processor, cls.get_renderer()),
+            ],
+        )
+        file_formatter = structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=cls.get_common_processors(settings=settings),
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                cast(structlog.typing.Processor, cls.get_file_renderer()),
+            ],
+        )
+        otel_formatter = structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=cls.get_common_processors(settings=settings),
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                cast(structlog.typing.Processor, StructlogOTELProcessor()),
+                structlog.processors.KeyValueRenderer(),
+            ],
+        )
+        console_handler = logging.StreamHandler()
+        console_handler.set_name("default")
+        console_handler.setLevel(level)
+        console_handler.setFormatter(console_formatter)
+        third_party_loggers = cls.get_third_party_loggers(settings)
+        for logger_name in logging.root.manager.loggerDict:
+            logger = logging.getLogger(logger_name)
+            is_enabled = logger_name in third_party_loggers
+            is_third_party_child = any(logger_name.startswith(parent + ".") for parent in third_party_loggers)
+            if is_enabled or is_third_party_child:
+                logger.setLevel(cls.get_custom_level(level, logger_name) if is_enabled else logging.NOTSET)
+                logger.handlers.clear()
+                logger.propagate = True
+                if logger_name.startswith("uvicorn") or logger_name.startswith("sqlalchemy.engine"):  # for better DX
+                    cls.maybe_add_otel_handler(
+                        target_logger=logger, otel_formatter=otel_formatter, settings=settings, level=level
+                    )
+                    logger.addHandler(console_handler)
+                    logger.propagate = False
+            else:
+                logger.disabled = logger_name not in app_loggers
+        root_logger = logging.getLogger()
+        root_logger.handlers.clear()
+        root_logger.setLevel(level)
+        root_logger.propagate = False
+        if logserver:
+            root_logger.addHandler(console_handler)
+            file_handler = cls.configure_file_logging(settings=settings, formatter=file_formatter, level=level)
+            if file_handler is not None:
+                root_logger.addHandler(file_handler)
+        else:
+            cls.maybe_add_otel_handler(
+                target_logger=root_logger, otel_formatter=otel_formatter, settings=settings, level=level
+            )
+            handler = MsgpackHandler(settings.logserver_client_host, LOGSERVER_PORT)
+            handler.setLevel(level)
+            root_logger.addHandler(handler)
 
+    @classmethod
     def configure_structlog(cls, *, settings: Settings) -> None:
-        pass  # TODO: implement
+        structlog.configure_once(
+            processors=cls.get_structlog_processors(settings=settings),
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            wrapper_class=structlog.stdlib.BoundLogger,
+            cache_logger_on_first_use=True,
+        )
 
+    @classmethod
     def configure(cls, *, settings: Settings, logserver: bool = False) -> None:
-        pass  # TODO: implement
+        cls.configure_stdlib(settings=settings, logserver=logserver)
+        cls.configure_structlog(settings=settings)
 
+    @staticmethod
     def timed_log_namer(default_name: str) -> str:
-        pass  # TODO: implement
+        base_filename, *ext, date = default_name.split(".")
+        return f"{base_filename}{date}.{'.'.join(ext)}"  # i.e. "crypto-payment-processor12345678.log"
 
+    @classmethod
     def configure_file_logging(
-        pass  # TODO: implement
+        cls, *, level: str, formatter: logging.Formatter, settings: Settings
+    ) -> TimedRotatingFileHandler | None:
+        if settings.log_file:
+            handler = TimedRotatingFileHandler(settings.log_file, when="midnight")
+            handler.suffix = "%Y%m%d"
+            handler.extMatch = re.compile(r"^\d{8}(\.\w+)?$")
+            handler.namer = cls.timed_log_namer
+            handler.setFormatter(formatter)
+            handler.setLevel(level)
+            return handler
+        return None
 
 
 class Development(Logging[structlog.dev.ConsoleRenderer]):
-    pass  # TODO: implement
+    @classmethod
     def get_renderer(cls) -> structlog.dev.ConsoleRenderer:
-        pass  # TODO: implement
+        return structlog.dev.ConsoleRenderer(colors=True, exception_formatter=plain_traceback, pad_level=False)
 
+    @classmethod
     def get_file_renderer(cls) -> structlog.dev.ConsoleRenderer:
-        pass  # TODO: implement
+        return structlog.dev.ConsoleRenderer(colors=False, exception_formatter=plain_traceback, pad_level=False)
 
 
 # TODO: implement it one day
@@ -141,29 +307,37 @@ Production = Development
 
 
 def configure(*, settings: Settings, logserver: bool = False) -> None:
-    pass  # TODO: implement
+    if settings.is_testing() or settings.is_development():
+        Development.configure(settings=settings, logserver=logserver)
+    else:
+        Production.configure(settings=settings, logserver=logserver)
 
 
 def generate_correlation_id() -> str:
-    pass  # TODO: implement
+    return str(uuid.uuid4())
 
 
 def get_exception_message(exc: Exception) -> str:
-    pass  # TODO: implement
+    return "\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
 def get_exception_summary(exc: BaseException) -> str:
-    pass  # TODO: implement
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 def get_exception_details(exc: BaseException) -> str:
-    pass  # TODO: implement
+    return f"{exc} ({get_exception_summary(exc.__cause__)})" if exc.__cause__ else str(exc)
 
 
 @contextmanager
 def log_errors(logger: Logger) -> Iterator[None]:  # pragma: no cover
-    pass  # TODO: implement
+    try:
+        yield
+    except Exception as e:
+        logger.error(get_exception_message(e))
 
 
 def get_logger(name: str) -> Logger:
-    pass  # TODO: implement
+    app_loggers.add(name)
+    logger: Logger = structlog.get_logger(name)
+    return logger

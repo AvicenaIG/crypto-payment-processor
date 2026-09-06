@@ -2,11 +2,15 @@ from btc import BTCDaemon
 
 
 class LTCDaemon(BTCDaemon):
-    pass  # TODO: implement
+    name = "LTC"
+    DEFAULT_PORT = 5001
 
     def load_electrum(self):
-        pass  # TODO: implement
+        import electrum_ltc
 
+        self.electrum = electrum_ltc
 
 
 if __name__ == "__main__":
+    daemon = LTCDaemon()
+    daemon.start()

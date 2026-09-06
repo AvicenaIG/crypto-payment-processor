@@ -13,6 +13,15 @@ from api.ext.moneyformat import currency_table
 from api.logging import get_exception_message, get_logger, log_errors
 from api.redis import Redis
 from api.schemas.tasks import (
+    AgentCallMessage,
+    DeployTaskMessage,
+    LicenseChangedMessage,
+    PluginTaskMessage,
+    ProcessNewBackupPolicyMessage,
+    RatesActionMessage,
+    SendNotificationMessage,
+    SendVerificationEmailMessage,
+    SyncWalletMessage,
 )
 from api.services.backup_manager import BackupManager
 from api.services.coins import CoinService
@@ -32,8 +41,10 @@ logger = get_logger(__name__)
 
 settings = Settings()
 broker = TasksBroker(url=settings.redis_url).with_result_backend(
+    RedisAsyncResultBackend(redis_url=settings.redis_url, keep_results=False, result_ex_time=60)
 )
 client_tasks_broker = TasksBroker(url=settings.redis_url, queue_name="taskiq_client_tasks").with_result_backend(
+    RedisAsyncResultBackend(redis_url=settings.redis_url, keep_results=False, result_ex_time=60)
 )
 redis_scheduler_source = ListRedisScheduleSource(settings.redis_url)
 label_scheduler_resource = LabelScheduleSource(broker)
@@ -44,46 +55,100 @@ del settings
 @broker.task("rates_action")
 @inject(patch_module=True)
 async def rates_action(
+    params: RatesActionMessage,
+    exchange_rate_service: FromDishka[ExchangeRateService],
 ) -> str:
     func = getattr(exchange_rate_service, params.func)
-        pass  # TODO: implement
+    return json.dumps(await func(*params.args), cls=utils.common.DecimalAwareJSONEncoder)
 
 
 @broker.task("agent_call")
 @inject(patch_module=True)
 async def agent_call(params: AgentCallMessage, host_agent: FromDishka[HostAgentService]) -> dict[str, Any]:
+    return await host_agent.handle_call(params.command, params.args)
 
 
 @broker.task("send_verification_email")
 @inject(patch_module=True)
 async def send_verification_email(params: SendVerificationEmailMessage, user_service: FromDishka[UserService]) -> None:
+    user = await user_service.get_or_none(params.user_id)
+    if not user:
+        return
+    await user_service.send_verification_email(user)
 
 
 @broker.task("sync_wallet")
 @inject(patch_module=True)
 async def sync_wallet(
+    params: SyncWalletMessage,
+    wallet_service: FromDishka[WalletService],
+    coin_service: FromDishka[CoinService],
+    redis_pool: FromDishka[Redis],
+    plugin_registry: FromDishka[PluginRegistry],
+    exchange_rate_service: FromDishka[ExchangeRateService],
+    wallet_data_service: FromDishka[WalletDataService],
 ) -> None:
+    model = await wallet_service.get_or_none(params.wallet_id)
+    if not model:
+        return
+    coin = await coin_service.get_coin(
+        model.currency, {"xpub": model.xpub, "contract": model.contract, **model.additional_xpub_data}
+    )
+    try:
+        balance = await coin.balance()
+        divisibility = await wallet_data_service.get_divisibility(model, coin)
+    except Exception as e:
+        logger.error(f"Wallet {model.id} failed to sync:\n{get_exception_message(e)}")
+        await utils.redis.publish_message(
+            redis_pool,
+            f"wallet:{model.id}",
+            {"status": "error", "balance": currency_table.format_decimal(model.currency, Decimal(0))},
+        )
+    else:
+        await plugin_registry.run_hook("wallet_synced", model, balance)
+        logger.info(f"Wallet {model.id} synced, balance: {balance['confirmed']}")
+        await utils.redis.publish_message(
+            redis_pool,
+            f"wallet:{model.id}",
+            {
+                "status": "success",
+                "balance": currency_table.format_decimal(model.currency, balance["confirmed"], divisibility=divisibility),
+            },
+        )
+    if model.contract:
+        with log_errors(logger):
+            await exchange_rate_service.preload_contract(model.contract, model.currency)
 
 
 @broker.task("send_notification")
 @inject(patch_module=True)
 async def send_notification(
+    params: SendNotificationMessage,
+    notification_manager: FromDishka[NotificationManager],
+    store_service: FromDishka[StoreService],
 ) -> None:
+    store = await store_service.get_or_none(params.store_id)
+    if not store:
+        return
+    await notification_manager.notify(store, params.text)
 
 
 @broker.task("process_new_backup_policy")
 @inject(patch_module=True)
 async def process_new_backup_policy(params: ProcessNewBackupPolicyMessage, backup_manager: FromDishka[BackupManager]) -> None:
+    await backup_manager.process_new_policy(params.old_policy, params.new_policy)
 
 
 @broker.task("deploy_task")
 @inject(patch_module=True)
 async def deploy_task(params: DeployTaskMessage, configurator_service: FromDishka[ConfiguratorService]) -> None:
+    return await configurator_service.run_deploy_task(params.task_id)
 
 
 @broker.task("license_changed")
 @inject(patch_module=True)
 async def license_changed(params: LicenseChangedMessage, plugin_registry: FromDishka[PluginRegistry]) -> None:
+    await plugin_registry.run_hook("license_changed", params.license_key, params.license_info)
 
 
 # We need two tasks here due to the way taskiq works, with shared task it seems to execute only in one broker
@@ -91,8 +156,10 @@ async def license_changed(params: LicenseChangedMessage, plugin_registry: FromDi
 @broker.task("plugin_task_server")
 @inject(patch_module=True)
 async def plugin_task_server(params: PluginTaskMessage, plugin_registry: FromDishka[PluginRegistry]) -> None:
+    await plugin_registry.process_plugin_task(params)
 
 
 @client_tasks_broker.task("plugin_task_client")
 @inject(patch_module=True)
 async def plugin_task_client(params: PluginTaskMessage, plugin_registry: FromDishka[PluginRegistry]) -> None:
+    await plugin_registry.process_plugin_task(params)

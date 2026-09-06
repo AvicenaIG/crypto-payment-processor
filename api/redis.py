@@ -19,10 +19,29 @@ REDIS_RETRY = Retry(default_backoff(), retries=50)
 
 
 async def create_redis(settings: Settings) -> AsyncIterator[Redis]:
+    redis = _async_redis.Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        max_connections=2**31,
+        retry_on_error=REDIS_RETRY_ON_ERRROR,
+        retry=REDIS_RETRY,
+        # TODO: re-check if those 2 are necessary
+        socket_timeout=None,
+        socket_connect_timeout=None,
+    )
+    yield redis
+    await redis.close()
 
 
 async def get_redis(request: Request) -> Redis:
+    return request.state.redis
 
 
 __all__ = [
+    "Redis",
+    "PubSub",
+    "REDIS_RETRY_ON_ERRROR",
+    "REDIS_RETRY",
+    "create_redis",
+    "get_redis",
 ]

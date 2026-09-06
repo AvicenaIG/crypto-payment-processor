@@ -16,34 +16,90 @@ logger = get_logger(__name__)
 
 
 class OpenAPIExternalDoc(TypedDict):
-    pass  # TODO: implement
+    description: NotRequired[str]
+    url: str
 
 
 class OpenAPITag(TypedDict):
-    pass  # TODO: implement
+    name: str
+    description: NotRequired[str]
+    externalDocs: NotRequired[dict[str, str]]
 
 
 class APITag(StrEnum):
-    pass  # TODO: implement
+    """
+    Tags used by our documentation to better organize the endpoints.
 
+    They should be set after the "group" tag, which is used to group the endpoints
+    in the generated documentation.
 
+    **Example**
 
+        ```py
+        router = APIRouter(prefix="/products", tags=["products", APITag.featured])
+        ```
+    """
 
+    users = "users"
 
+    @classmethod
     def metadata(cls) -> list[OpenAPITag]:
-        pass  # TODO: implement
+        return [
+            {
+                "name": cls.users,
+                "description": ("Endpoints related to user management in Bitcart API."),
+            },
+        ]
 
 
 def generate_operation_id(route: APIRoute) -> str:
-    pass  # TODO: implement
+    tag = next(iter(route.tags), "default")
+    if isinstance(tag, Enum):
+        tag = tag.value
+    return f"{tag}_{route.name}"
 
 
 class OpenAPIParameters(TypedDict):
-    pass  # TODO: implement
+    title: str
+    summary: str
+    version: str
+    description: str
+    docs_url: str | None
+    redoc_url: str | None
+    openapi_tags: list[dict[str, Any]]
+    servers: list[dict[str, Any]] | None
 
 
 def get_openapi_parameters(settings: Settings) -> OpenAPIParameters:
-    pass  # TODO: implement
+    current_server = settings.ROOT_PATH or "/"
+    return {
+        "title": settings.API_TITLE,
+        "summary": "Bitcart Merchants API",
+        "version": VERSION,
+        "description": "Read the docs at https://docs.crypto-payment-processor.ai",
+        "docs_url": None,
+        "redoc_url": None,
+        "openapi_tags": APITag.metadata(),  # type: ignore
+        "swagger_ui_parameters": {
+            "docExpansion": "none",
+        },
+        "servers": [
+            {
+                "url": current_server,
+                "description": "Current instance",
+            },
+            {
+                "url": "https://api.crypto-payment-processor.ai",
+                "description": "Bitcart production demo",
+            },
+            {
+                "url": "https://testnet.crypto-payment-processor.ai/api",
+                "description": "Bitcart testnet demo",
+            },
+        ]
+        if settings.is_environment({Environment.sandbox, Environment.production})
+        else [{"url": current_server, "description": "Development environment"}],
+    }
 
 
 OPENAPI_URL = "/openapi.json"
@@ -51,22 +107,55 @@ OPENAPI_URL = "/openapi.json"
 
 # This is required to keep same format on live endpoint and the dumped openapi schema
 def dump_openapi(schema: dict[str, Any]) -> str:
-    pass  # TODO: implement
+    return json.dumps(schema, indent=2, ensure_ascii=False) + "\n"
 
 
 def set_openapi_route(app: FastAPI) -> None:
-    pass  # TODO: implement
+    @app.get(OPENAPI_URL, include_in_schema=False)
+    async def openapi_json(req: Request) -> Response:
+        return Response(dump_openapi(app.openapi()), media_type="application/json")
 
+    app.openapi_url = OPENAPI_URL
 
 
 def set_openapi_generator(app: FastAPI, settings: Settings) -> None:
-    pass  # TODO: implement
     def _openapi_generator() -> dict[str, Any]:
-        pass  # TODO: implement
+        if app.openapi_schema:
+            return app.openapi_schema
 
+        if settings.OPENAPI_PATH:
+            with log_errors(logger), open(settings.OPENAPI_PATH) as f:
+                app.openapi_schema = json.loads(f.read())
 
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            openapi_version=app.openapi_version,
+            summary=app.summary,
+            description=app.description,
+            terms_of_service=app.terms_of_service,
+            contact=app.contact,
+            license_info=app.license_info,
+            routes=app.routes,
+            webhooks=app.webhooks.routes,
+            tags=app.openapi_tags,
+            servers=app.servers,
+            separate_input_output_schemas=app.separate_input_output_schemas,
+        )
+        # for plugins to add custom scopes
+        schema["components"]["securitySchemes"]["Bearer"]["flows"]["password"]["scopes"] = get_all_scopes()
+        schema["components"]["securitySchemes"]["BearerOptional"]["flows"]["password"]["scopes"] = get_all_scopes()
+        app.openapi_schema = schema
+        return schema
 
+    app.openapi = _openapi_generator  # type: ignore[method-assign]
 
 
 __all__ = [
+    "get_openapi_parameters",
+    "APITag",
+    "dump_openapi",
+    "generate_operation_id",
+    "set_openapi_generator",
+    "set_openapi_route",
 ]

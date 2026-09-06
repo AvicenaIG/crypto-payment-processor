@@ -1,7 +1,9 @@
 import os
 
 if os.getenv("BITCART_OTEL_ENABLED", "false").lower() == "true":
+    from api.otel import initialize
 
+    initialize()
 
 
 from api.bootstrap import configure_production_app

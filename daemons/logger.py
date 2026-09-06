@@ -6,24 +6,56 @@ import sys
 
 
 class OTelExtraStripper(logging.Filter):
-    pass  # TODO: implement
     def filter(self, record: logging.LogRecord) -> bool:
-        pass  # TODO: implement
+        for attr in ("levellower",):
+            if hasattr(record, attr):
+                delattr(record, attr)
+        return True
 
 
 class UTCFormatter(logging.Formatter):
-    pass  # TODO: implement
     def formatTime(self, record, datefmt=None):
-        pass  # TODO: implement
+        dt = datetime.datetime.fromtimestamp(record.created, tz=datetime.UTC)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
 
     def format(self, record):
-        pass  # TODO: implement
+        record.levellower = record.levelname.lower()
+        return super().format(record)
 
 
 def configure_logging(debug: bool = False):
-    pass  # TODO: implement
+    if not debug:
+        logging.disable(logging.CRITICAL)
+        return
+    logging.disable(logging.NOTSET)
+    log_format = "%(asctime)s [%(levellower)s] %(message)s [%(name)s]"
+    date_format = "%Y-%m-%d %H:%M:%S.%f %Z"
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    formatter = UTCFormatter(log_format, datefmt=date_format)
+    handler.setFormatter(formatter)
+    root_logger.addHandler(handler)
+    if os.getenv("BITCART_OTEL_ENABLED", "false").lower() == "true":
+        from opentelemetry._logs import get_logger_provider
+        from opentelemetry.instrumentation.logging.handler import LoggingHandler
 
+        otel_handler = LoggingHandler(level=logging.NOTSET, logger_provider=get_logger_provider(), log_code_attributes=True)
+        otel_handler.addFilter(OTelExtraStripper())
+        root_logger.addHandler(otel_handler)
+    # turn off loggers which will appear later and not yet loaded
+    logging.getLogger("httpcore").setLevel(logging.CRITICAL + 1)
+    for logger_name in list(logging.Logger.manager.loggerDict.keys()):
+        if not logger_name.startswith("daemons.") and logger_name != "daemons" and not logger_name.startswith("electrum"):
+            logging.getLogger(logger_name).disabled = True
+            logging.getLogger(logger_name).propagate = False
 
 
 def get_logger(name: str) -> logging.Logger:
-    pass  # TODO: implement
+    if not name.startswith("daemons.") and name != "daemons":
+        name = f"daemons.{name}"
+    return logging.getLogger(name)

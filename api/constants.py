@@ -14,6 +14,7 @@ LOGSERVER_PORT = 9020  # port for logserver in the worker
 ALPHABET = string.ascii_letters  # used by ID generator
 SUPPORTED_CRYPTOS = {coin.lower(): obj.friendly_name for (coin, obj) in _COINS.items()}  # all cryptos supported by the SDK
 HTTPS_REVERSE_PROXIES = [
+    "nginx-https"
 ]  # reverse proxies supporting https; NOTE: maybe this could be used by accessing generator package?
 ID_LENGTH = 26  # default length of IDs of all objects except for invoice
 PUBLIC_ID_LENGTH = 22  # The length of invoice and products ids; should be shorter than usual for better UX
@@ -27,6 +28,12 @@ CONFIGURATOR_SSH_RATE_WINDOW = 60 * 60  # fixed window in seconds
 BACKUP_PROVIDERS = ["local", "scp", "s3"]
 BACKUP_FREQUENCIES = ["daily", "weekly", "monthly"]
 STR_TO_BOOL_MAPPING = {
+    "true": True,
+    "yes": True,
+    "1": True,
+    "false": False,
+    "no": False,
+    "0": False,
 }  # common str -> bool conversions
 # due to many exchanges lacking more than 8 digits, we limit eth-based divisibility for invoices to 8
 MAX_CONTRACT_DIVISIBILITY = 8
@@ -43,22 +50,52 @@ HTTPS_REVERSE_PROXIES = ["nginx-https"]
 
 
 class AuthScopes(enum.StrEnum):
-    pass  # TODO: implement
+    SERVER_MANAGEMENT = "server_management"
+    TOKEN_MANAGEMENT = "token_management"  # noqa: S105
+    WALLET_MANAGEMENT = "wallet_management"
+    STORE_MANAGEMENT = "store_management"
+    DISCOUNT_MANAGEMENT = "discount_management"
+    PRODUCT_MANAGEMENT = "product_management"
+    INVOICE_MANAGEMENT = "invoice_management"
+    PAYOUT_MANAGEMENT = "payout_management"
+    NOTIFICATION_MANAGEMENT = "notification_management"
+    TEMPLATE_MANAGEMENT = "template_management"
+    FILE_MANAGEMENT = "file_management"
+    METRICS_MANAGEMENT = "metrics_management"
+    FULL_CONTROL = "full_control"
 
 
 CRUD_MODELS = [
+    "discounts",
+    "files",
+    "invoices",
+    "notifications",
+    "payouts",
+    "products",
+    "stores",
+    "templates",
+    "wallets",
 ]
 
 
 class PayoutStatus:
-    pass  # TODO: implement
+    PENDING = "pending"
+    APPROVED = "approved"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    SENT = "sent"
+    COMPLETE = "complete"
 
 
 SENT_PAYOUT_STATUSES = [PayoutStatus.SENT, PayoutStatus.COMPLETE]
 
 
 def get_max_confirmation_watch(currency: str) -> int:
-    pass  # TODO: implement
+    match currency:
+        case "xmr":
+            return 32
+        case "default" | _:
+            return 10
 
 
 MAX_CONFIRMATION_WATCH = get_max_confirmation_watch("default")  # maximum number of confirmations to save
