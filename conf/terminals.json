@@ -1,0 +1,26 @@
+{
+    "autorun": false,
+    "terminals": [
+        {
+            "name": "BTC Daemon",
+            "description": "BTC Daemon",
+            "command": "just daemon btc"
+        },
+        {
+            "name": "LTC Daemon",
+            "description": "LTC Daemon",
+            "command": "just daemon ltc"
+        },
+        {
+            "name": "Uvicorn debug",
+            "description": "Uvicorn debug",
+            "focus": true,
+            "commands": ["unset DEBUG", "just dev-api"]
+        },
+        {
+            "name": "Worker",
+            "description": "Worker",
+            "commands": ["unset DEBUG", "just worker"]
+        }
+    ]
+}
