@@ -1,0 +1,36 @@
+from typing import Any
+
+from dishka import AsyncContainer
+
+from api import models
+from api.db import AsyncSession
+from api.services.crud import CRUDService
+from api.services.crud.repositories import NotificationRepository
+from api.services.notification_manager import NotificationManager
+from api.settings import Settings
+
+
+class NotificationService(CRUDService[models.Notification]):
+    repository_type = NotificationRepository
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        container: AsyncContainer,
+        settings: Settings,
+        notification_manager: NotificationManager,
+    ) -> None:
+        super().__init__(session, container)
+        self.settings = settings
+        self.notification_manager = notification_manager
+
+    async def prepare_update(self, data: dict[str, Any], model: models.Notification) -> dict[str, Any]:
+        data = await super().prepare_update(data, model)
+        if "provider" in data and "data" not in data and model.provider != data["provider"]:
+            data["data"] = {}
+        return data
+
+    async def load_one(self, item: models.Notification) -> None:
+        await super().load_one(item)
+        item.error = False
+        item.error = item.provider not in self.notification_manager.notifiers
