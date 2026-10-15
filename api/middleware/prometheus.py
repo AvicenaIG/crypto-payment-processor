@@ -18,7 +18,6 @@ from api.metrics import (
     http_response_size_bytes,
 )
 
-
 def _get_route_name(scope: Scope, routes: Sequence[BaseRoute | RouteContext]) -> str | None:
     for route in iter_route_contexts(routes):
         match, child_scope = route.matches(scope)
@@ -34,7 +33,6 @@ def _get_route_name(scope: Scope, routes: Sequence[BaseRoute | RouteContext]) ->
         return path
     return None
 
-
 def _resolve_handler(request: Request) -> str | None:
     router = request.app.router
     route_name = _get_route_name(request.scope, router.routes)
@@ -48,10 +46,8 @@ def _resolve_handler(request: Request) -> str | None:
             route_name = route_name + "/" if trim else route_name[:-1]
     return route_name
 
-
 def _content_length(headers: Headers) -> int:
     return int(headers.get("content-length") or 0)
-
 
 class PrometheusMiddleware:
     def __init__(self, app: ASGIApp, excluded_handlers: tuple[str, ...] = ("/metrics",)) -> None:
